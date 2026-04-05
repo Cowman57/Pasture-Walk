@@ -37,8 +37,15 @@ class _KPIsScreenState extends State<KPIsScreen> {
 
   Future<void> _init() async {
     final now = DateTime.now();
-    final start = DateTime(now.year, now.month, now.day).subtract(const Duration(days: 60));
-    range = DateTimeRange(start: start, end: DateTime(now.year, now.month, now.day));
+    final start = DateTime(
+      now.year,
+      now.month,
+      now.day,
+    ).subtract(const Duration(days: 60));
+    range = DateTimeRange(
+      start: start,
+      end: DateTime(now.year, now.month, now.day),
+    );
     await _load();
   }
 
@@ -57,11 +64,21 @@ class _KPIsScreenState extends State<KPIsScreen> {
 
   DateTime _day(DateTime d) => DateTime(d.year, d.month, d.day);
 
-  bool _sameDay(DateTime a, DateTime b) =>
-      a.year == b.year && a.month == b.month && a.day == b.day;
-
   String _fmtDateShort(DateTime d) {
-    const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const m = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
     final dd = d.day.toString().padLeft(2, '0');
     return '$dd ${m[d.month - 1]}';
   }
@@ -91,9 +108,11 @@ class _KPIsScreenState extends State<KPIsScreen> {
     final endDay = _day(r.end);
 
     final days = <DateTime>[];
-    for (DateTime d = startDay;
-    !d.isAfter(endDay);
-    d = d.add(const Duration(days: 1))) {
+    for (
+      DateTime d = startDay;
+      !d.isAfter(endDay);
+      d = d.add(const Duration(days: 1))
+    ) {
       days.add(d);
     }
 
@@ -123,7 +142,11 @@ class _KPIsScreenState extends State<KPIsScreen> {
         if (daysDiff <= 0) continue;
 
         // exclude if grazed between prev and cur
-        final grazedBetween = await storage.paddockGrazedBetween(entry.key, prev.at, cur.at);
+        final grazedBetween = await storage.paddockGrazedBetween(
+          entry.key,
+          prev.at,
+          cur.at,
+        );
         if (grazedBetween) continue;
 
         final rate = (cur.cover - prev.cover) / daysDiff;
@@ -133,13 +156,20 @@ class _KPIsScreenState extends State<KPIsScreen> {
 
     growthSeries = days.map((d) {
       final arr = growthByDay[d];
-      final v = (arr == null || arr.isEmpty) ? double.nan : arr.reduce((a, b) => a + b) / arr.length;
+      final v = (arr == null || arr.isEmpty)
+          ? double.nan
+          : arr.reduce((a, b) => a + b) / arr.length;
       return _Point(d, v);
     }).toList();
 
     // Avg growth (ignoring NaNs)
-    final growthVals = growthSeries.where((p) => p.y.isFinite).map((p) => p.y).toList();
-    avgGrowth = growthVals.isEmpty ? 0 : growthVals.reduce((a, b) => a + b) / growthVals.length;
+    final growthVals = growthSeries
+        .where((p) => p.y.isFinite)
+        .map((p) => p.y)
+        .toList();
+    avgGrowth = growthVals.isEmpty
+        ? 0
+        : growthVals.reduce((a, b) => a + b) / growthVals.length;
 
     // -----------------------------
     // 2) Cover series (farm avg measured cover per day)
@@ -154,19 +184,29 @@ class _KPIsScreenState extends State<KPIsScreen> {
 
     coverSeries = days.map((d) {
       final arr = coverByDay[d];
-      final v = (arr == null || arr.isEmpty) ? double.nan : arr.reduce((a, b) => a + b) / arr.length;
+      final v = (arr == null || arr.isEmpty)
+          ? double.nan
+          : arr.reduce((a, b) => a + b) / arr.length;
       return _Point(d, v);
     }).toList();
 
-    final coverVals = coverSeries.where((p) => p.y.isFinite).map((p) => p.y).toList();
-    avgCover = coverVals.isEmpty ? 0 : coverVals.reduce((a, b) => a + b) / coverVals.length;
+    final coverVals = coverSeries
+        .where((p) => p.y.isFinite)
+        .map((p) => p.y)
+        .toList();
+    avgCover = coverVals.isEmpty
+        ? 0
+        : coverVals.reduce((a, b) => a + b) / coverVals.length;
 
     // -----------------------------
-    // 3) Round length series (avg days between grazings per day)
+    // -----------------------------
+    // 3) Round length series (avg days BETWEEN GRAZINGS per day)
     // For each grazing, compare to previous grazing for that paddock.
     // Attribute interval to the day of the later grazing.
     // -----------------------------
     final roundByDay = <DateTime, List<double>>{};
+    final allIntervals = <double>[];
+
     final gsByPdk = <String, List<Grazing>>{};
     for (final g in gs) {
       (gsByPdk[g.paddockId] ??= []).add(g);
@@ -184,18 +224,23 @@ class _KPIsScreenState extends State<KPIsScreen> {
         final dd = cur.at.difference(prev.at).inDays;
         if (dd <= 0) continue;
 
+        allIntervals.add(dd.toDouble());
         (roundByDay[curDay] ??= []).add(dd.toDouble());
       }
     }
 
     roundSeries = days.map((d) {
       final arr = roundByDay[d];
-      final v = (arr == null || arr.isEmpty) ? double.nan : arr.reduce((a, b) => a + b) / arr.length;
+      final v = (arr == null || arr.isEmpty)
+          ? double.nan
+          : arr.reduce((a, b) => a + b) / arr.length;
       return _Point(d, v);
     }).toList();
 
-    final roundVals = roundSeries.where((p) => p.y.isFinite).map((p) => p.y).toList();
-    avgRound = roundVals.isEmpty ? 0 : roundVals.reduce((a, b) => a + b) / roundVals.length;
+    // ✅ Average round length is computed from grazing intervals (not from the daily series)
+    avgRound = allIntervals.isEmpty
+        ? 0
+        : allIntervals.reduce((a, b) => a + b) / allIntervals.length;
 
     // -----------------------------
     // 4) Problem paddocks (worst growth over range)
@@ -215,7 +260,11 @@ class _KPIsScreenState extends State<KPIsScreen> {
         final daysDiff = cur.at.difference(prev.at).inDays;
         if (daysDiff <= 0) continue;
 
-        final grazedBetween = await storage.paddockGrazedBetween(entry.key, prev.at, cur.at);
+        final grazedBetween = await storage.paddockGrazedBetween(
+          entry.key,
+          prev.at,
+          cur.at,
+        );
         if (grazedBetween) continue;
 
         final rate = (cur.cover - prev.cover) / daysDiff;
@@ -255,82 +304,84 @@ class _KPIsScreenState extends State<KPIsScreen> {
       body: !loaded
           ? const Center(child: CircularProgressIndicator())
           : ListView(
-        padding: const EdgeInsets.all(12),
-        children: [
-          _RangeChip(
-            text: '${_fmtDateShort(r.start)} → ${_fmtDateShort(r.end)}',
-            onTap: _pickRange,
-          ),
-          const SizedBox(height: 12),
-
-          _KpiCard(
-            title: 'Average farm growth',
-            value: '${_fmt1(avgGrowth)} kgDM/ha/day',
-            child: _LineChart(
-              points: growthSeries,
-              yLabel: 'kgDM/ha/day',
-            ),
-          ),
-
-          const SizedBox(height: 12),
-
-          _KpiCard(
-            title: 'Average pasture cover',
-            value: avgCover <= 0 ? '—' : '${_fmt1(avgCover)} kgDM/ha',
-            child: _LineChart(
-              points: coverSeries,
-              yLabel: 'kgDM/ha',
-            ),
-          ),
-
-          const SizedBox(height: 12),
-
-          _KpiCard(
-            title: 'Average round length',
-            value: avgRound <= 0 ? '—' : '${_fmt1(avgRound)} days',
-            child: _LineChart(
-              points: roundSeries,
-              yLabel: 'days',
-            ),
-          ),
-
-          const SizedBox(height: 12),
-
-          _KpiCard(
-            title: 'Problem paddocks (worst growth)',
-            value: 'Bottom ${problem.length} (excluded paddocks ignored)',
-            child: problem.isEmpty
-                ? const Padding(
-              padding: EdgeInsets.symmetric(vertical: 12),
-              child: Text('Not enough data in this date range.'),
-            )
-                : Column(
+              padding: const EdgeInsets.all(12),
               children: [
-                for (final p in problem)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 6),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            p.name,
-                            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Text(
-                          '${_fmt1(p.avgGrowth)} /day',
-                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
-                        ),
-                      ],
-                    ),
+                _RangeChip(
+                  text: '${_fmtDateShort(r.start)} → ${_fmtDateShort(r.end)}',
+                  onTap: _pickRange,
+                ),
+                const SizedBox(height: 12),
+
+                _KpiCard(
+                  title: 'Average farm growth',
+                  value: '${_fmt1(avgGrowth)} kgDM/ha/day',
+                  child: _LineChart(
+                    points: growthSeries,
+                    yLabel: 'kgDM/ha/day',
                   ),
+                ),
+
+                const SizedBox(height: 12),
+
+                _KpiCard(
+                  title: 'Average pasture cover',
+                  value: avgCover <= 0 ? '—' : '${_fmt1(avgCover)} kgDM/ha',
+                  child: _LineChart(points: coverSeries, yLabel: 'kgDM/ha'),
+                ),
+
+                const SizedBox(height: 12),
+
+                _KpiCard(
+                  title: 'Average round length',
+                  value: avgRound <= 0 ? '—' : '${_fmt1(avgRound)} days',
+                  child: _LineChart(points: roundSeries, yLabel: 'days'),
+                ),
+
+                const SizedBox(height: 12),
+
+                _KpiCard(
+                  title: 'Problem paddocks (worst growth)',
+                  value: 'Bottom ${problem.length} (excluded paddocks ignored)',
+                  child: problem.isEmpty
+                      ? const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 12),
+                          child: Text('Not enough data in this date range.'),
+                        )
+                      : Column(
+                          children: [
+                            for (final p in problem)
+                              Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 6,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        p.name,
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Text(
+                                      '${_fmt1(p.avgGrowth)} /day',
+                                      style: const TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w800,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                          ],
+                        ),
+                ),
               ],
             ),
-          ),
-        ],
-      ),
     );
   }
 }
@@ -353,15 +404,25 @@ class _KpiCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       elevation: 0,
-      color: Colors.black.withOpacity(0.04),
+      color: Colors.black.withValues(alpha: 0.04),
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(title, style: const TextStyle(fontSize: 12, color: Colors.black54, fontWeight: FontWeight.w700)),
+            Text(
+              title,
+              style: const TextStyle(
+                fontSize: 12,
+                color: Colors.black54,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
             const SizedBox(height: 6),
-            Text(value, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900)),
+            Text(
+              value,
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+            ),
             const SizedBox(height: 10),
             child,
           ],
@@ -395,7 +456,13 @@ class _RangeChip extends StatelessWidget {
             children: [
               const Icon(Icons.date_range, size: 18),
               const SizedBox(width: 8),
-              Text(text, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700)),
+              Text(
+                text,
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
             ],
           ),
         ),
@@ -435,7 +502,14 @@ class _LineChartState extends State<_LineChart> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(widget.yLabel, style: const TextStyle(fontSize: 11, color: Colors.black54, fontWeight: FontWeight.w700)),
+        Text(
+          widget.yLabel,
+          style: const TextStyle(
+            fontSize: 11,
+            color: Colors.black54,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
         const SizedBox(height: 6),
         SizedBox(
           height: height,
@@ -451,9 +525,7 @@ class _LineChartState extends State<_LineChart> {
                 child: SizedBox(
                   width: width,
                   height: height,
-                  child: CustomPaint(
-                    painter: _LineChartPainter(widget.points),
-                  ),
+                  child: CustomPaint(painter: _LineChartPainter(widget.points)),
                 ),
               ),
             ),
@@ -486,7 +558,12 @@ class _LineChartPainter extends CustomPainter {
     final padT = 12.0;
     final padB = 26.0;
 
-    final plot = Rect.fromLTWH(padL, padT, size.width - padL - padR, size.height - padT - padB);
+    final plot = Rect.fromLTWH(
+      padL,
+      padT,
+      size.width - padL - padR,
+      size.height - padT - padB,
+    );
 
     // Background
     final bg = Paint()..color = const Color(0xFFFFFFFF);
@@ -555,18 +632,50 @@ class _LineChartPainter extends CustomPainter {
     canvas.drawPath(path, line);
 
     // Y labels (min/max)
-    _drawText(canvas, '${minY.toStringAsFixed(0)}', Offset(6, plot.bottom - 10),
-        const TextStyle(fontSize: 10, color: Color(0x99000000), fontWeight: FontWeight.w700));
-    _drawText(canvas, '${maxY.toStringAsFixed(0)}', Offset(6, plot.top - 2),
-        const TextStyle(fontSize: 10, color: Color(0x99000000), fontWeight: FontWeight.w700));
+    _drawText(
+      canvas,
+      minY.toStringAsFixed(0),
+      Offset(6, plot.bottom - 10),
+      const TextStyle(
+        fontSize: 10,
+        color: Color(0x99000000),
+        fontWeight: FontWeight.w700,
+      ),
+    );
+    _drawText(
+      canvas,
+      maxY.toStringAsFixed(0),
+      Offset(6, plot.top - 2),
+      const TextStyle(
+        fontSize: 10,
+        color: Color(0x99000000),
+        fontWeight: FontWeight.w700,
+      ),
+    );
 
     // X labels (start/end)
     final start = points.first.x;
     final end = points.last.x;
-    _drawText(canvas, _shortDate(start), Offset(plot.left, plot.bottom + 6),
-        const TextStyle(fontSize: 10, color: Color(0x77000000), fontWeight: FontWeight.w700));
-    _drawText(canvas, _shortDate(end), Offset(plot.right - 64, plot.bottom + 6),
-        const TextStyle(fontSize: 10, color: Color(0x77000000), fontWeight: FontWeight.w700));
+    _drawText(
+      canvas,
+      _shortDate(start),
+      Offset(plot.left, plot.bottom + 6),
+      const TextStyle(
+        fontSize: 10,
+        color: Color(0x77000000),
+        fontWeight: FontWeight.w700,
+      ),
+    );
+    _drawText(
+      canvas,
+      _shortDate(end),
+      Offset(plot.right - 64, plot.bottom + 6),
+      const TextStyle(
+        fontSize: 10,
+        color: Color(0x77000000),
+        fontWeight: FontWeight.w700,
+      ),
+    );
   }
 
   void _drawNoData(Canvas canvas, Size size, Rect plot) {
@@ -574,12 +683,29 @@ class _LineChartPainter extends CustomPainter {
       canvas,
       'Not enough data',
       Offset(plot.left + 12, plot.top + plot.height / 2 - 8),
-      const TextStyle(fontSize: 14, color: Color(0x77000000), fontWeight: FontWeight.w800),
+      const TextStyle(
+        fontSize: 14,
+        color: Color(0x77000000),
+        fontWeight: FontWeight.w800,
+      ),
     );
   }
 
   String _shortDate(DateTime d) {
-    const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const m = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
     return '${d.day.toString().padLeft(2, '0')} ${m[d.month - 1]}';
   }
 
@@ -597,7 +723,8 @@ class _LineChartPainter extends CustomPainter {
     // repaint if points differ length or last timestamps differ
     if (oldDelegate.points.length != points.length) return true;
     if (points.isEmpty) return false;
-    return oldDelegate.points.last.x != points.last.x || oldDelegate.points.last.y != points.last.y;
+    return oldDelegate.points.last.x != points.last.x ||
+        oldDelegate.points.last.y != points.last.y;
   }
 }
 

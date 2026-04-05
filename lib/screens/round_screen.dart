@@ -12,54 +12,220 @@ class RoundScreen extends StatefulWidget {
   State<RoundScreen> createState() => _RoundScreenState();
 }
 
-class _RoundScreenState extends State<RoundScreen> {
+class _RoundScreenState extends State<RoundScreen>
+    with SingleTickerProviderStateMixin {
   final storage = Storage();
   final uuid = const Uuid();
 
   bool loaded = false;
 
+  bool _moving = false;
+
+  late final AnimationController _tapCtrl;
+  late final Animation<double> _tapOpacity;
+  late final Animation<double> _deltaT;
+  int _lastTapDelta = 0;
+  bool _lastTapWasIncrease = true;
+
+  bool _showHints = true;
+
   List<Paddock> order = [];
   int idx = 0;
+
+  int coverStep = 50;
 
   // Predicted "now" per paddock when screen was opened
   final Map<String, int> predictedNow = {};
 
-  // Last recorded measurement per paddock
+  // Last recorded measurement per paddock (latest, any date)
   final Map<String, Measurement?> lastMeasured = {};
+
+  // ✅ Draft (current-session) cover per paddock, so values "stick" when you go back/forth
+  final Map<String, int> draftCover = {};
 
   // Growth
   double farmGrowth = 0.0;
-  Map<String, double> mods = {};
-
-  // Editable value
-  int currentCover = 2500;
-
-  // +/- step amount (settings)
-  int step = 50;
-
-  // note buttons (settings)
   String noteBtn1 = 'Weeds';
   String noteBtn2 = 'Water leak';
+
+  // Editable value (big number)
+  int currentCover = 2500;
 
   @override
   void initState() {
     super.initState();
+    _tapCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 420),
+    );
+    _tapOpacity = CurvedAnimation(parent: _tapCtrl, curve: Curves.easeOut);
+    _deltaT = CurvedAnimation(parent: _tapCtrl, curve: Curves.easeInOut);
     _init();
   }
 
+  @override
+  void dispose() {
+    _tapCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _openNotesSheet() async {
+    final messenger = ScaffoldMessenger.of(context);
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+            child: Wrap(
+              runSpacing: 10,
+              children: [
+                SizedBox(
+                  width: double.infinity,
+                  height: 46,
+                  child: OutlinedButton(
+                    onPressed: () async {
+                      Navigator.of(ctx).pop();
+                      await _appendNote(noteBtn1);
+                      if (!mounted) return;
+                      messenger.showSnackBar(
+                        SnackBar(content: Text('Note added: $noteBtn1')),
+                      );
+                    },
+                    child: Text(noteBtn1),
+                  ),
+                ),
+                SizedBox(
+                  width: double.infinity,
+                  height: 46,
+                  child: OutlinedButton(
+                    onPressed: () async {
+                      Navigator.of(ctx).pop();
+                      await _appendNote(noteBtn2);
+                      if (!mounted) return;
+                      messenger.showSnackBar(
+                        SnackBar(content: Text('Note added: $noteBtn2')),
+                      );
+                    },
+                    child: Text(noteBtn2),
+                  ),
+                ),
+                SizedBox(
+                  width: double.infinity,
+                  height: 46,
+                  child: ElevatedButton(
+                    onPressed: () async {
+                      Navigator.of(ctx).pop();
+                      await _appendCustomNote();
+                    },
+                    child: const Text('Custom'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _jumpToPaddock() async {
+    if (order.isEmpty) return;
+
+    final pickOrder = [...order];
+    int numKey(Paddock p) {
+      final m = RegExp(r'\d+').firstMatch(p.name);
+      if (m == null) return 1 << 30;
+      return int.tryParse(m.group(0) ?? '') ?? (1 << 30);
+    }
+
+    pickOrder.sort((a, b) {
+      final an = numKey(a);
+      final bn = numKey(b);
+      if (an != bn) return an.compareTo(bn);
+      return a.name.compareTo(b.name);
+    });
+
+    final picked = await showModalBottomSheet<int>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        return SafeArea(
+          child: ListView.builder(
+            itemCount: pickOrder.length,
+            itemBuilder: (c, i) {
+              final p = pickOrder[i];
+              final selected = p.id == _p.id;
+              return ListTile(
+                title: Text(p.name),
+                trailing: selected ? const Icon(Icons.check) : null,
+                onTap: () => Navigator.of(
+                  ctx,
+                ).pop(order.indexWhere((x) => x.id == p.id)),
+              );
+            },
+          ),
+        );
+      },
+    );
+
+    if (picked == null) return;
+    if (picked == idx) return;
+    await _saveCurrent();
+    if (!mounted) return;
+    setState(() {
+      idx = picked;
+      currentCover = _coverForPaddock(_p.id);
+    });
+  }
+
+  void _fireTapFeedback(int delta) {
+    if (_showHints) setState(() => _showHints = false);
+    _lastTapDelta = delta;
+    _lastTapWasIncrease = delta > 0;
+    _tapCtrl.forward(from: 0);
+  }
+
+  void _dismissHints() {
+    if (!_showHints) return;
+    setState(() => _showHints = false);
+  }
+
+  Future<void> _navNext() async {
+    if (_moving) return;
+    if (idx >= order.length - 1) return;
+    _moving = true;
+    try {
+      await _next();
+    } finally {
+      _moving = false;
+    }
+  }
+
+  Future<void> _navPrev() async {
+    if (_moving) return;
+    if (idx <= 0) return;
+    _moving = true;
+    try {
+      await _prev();
+    } finally {
+      _moving = false;
+    }
+  }
+
+  bool _sameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
   Future<void> _init() async {
-    step = await storage.loadCoverStep();
+    order = await storage.loadPaddocks();
+    order = order.where((p) => p.includeInRotation).toList();
+    order.sort((a, b) => a.recordOrder.compareTo(b.recordOrder));
+
     noteBtn1 = await storage.loadNoteButton1Title();
     noteBtn2 = await storage.loadNoteButton2Title();
 
-    var all = await storage.loadPaddocks();
-    all.sort((a, b) => a.recordOrder.compareTo(b.recordOrder));
-
-    // Exclude paddocks not included in rotation
-    order = all.where((p) => p.includeInRotation).toList();
-
-    mods = await storage.loadGrowthModifiers();
-    farmGrowth = await storage.computeFarmGrowthKgDmPerHaPerDay();
+    farmGrowth = await storage.effectiveFarmGrowthKgDmPerHaPerDay();
 
     final now = DateTime.now();
 
@@ -71,27 +237,101 @@ class _RoundScreenState extends State<RoundScreen> {
       final base = anchor?.coverKgDmHa ?? 2500;
       final days = anchor == null ? 0 : now.difference(anchor.at).inDays;
 
-      final mod = mods[p.id] ?? 1.0;
-      final gEff = farmGrowth * mod;
+      predictedNow[p.id] = clampCover(base + (days * farmGrowth).round());
 
-      predictedNow[p.id] = clampCover(base + (days * gEff).round());
+      // ✅ If there is already a measurement today, start draft with that cover
+      if (lm != null && _sameDay(lm.at, now)) {
+        draftCover[p.id] = lm.cover;
+      }
     }
 
     if (order.isNotEmpty) {
-      currentCover = predictedNow[order[idx].id] ?? 2500;
+      currentCover = _coverForPaddock(order[idx].id);
     }
+    coverStep = await storage.loadCoverStep();
 
     loaded = true;
-    setState(() {});
+    if (mounted) setState(() {});
   }
 
   Paddock get _p => order[idx];
   int get _pred => predictedNow[_p.id] ?? 2500;
   Measurement? get _last => lastMeasured[_p.id];
-  double get _mod => mods[_p.id] ?? 1.0;
-  double get _gEff => farmGrowth * _mod;
+  double get _gEff => farmGrowth;
+
+  Future<void> _appendNote(String title) async {
+    final t = title.trim();
+    if (t.isEmpty) return;
+    await storage.appendNote(
+      NoteEntry(id: uuid.v4(), paddockId: _p.id, at: DateTime.now(), title: t),
+    );
+  }
+
+  Future<void> _appendCustomNote() async {
+    final ctrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Add note'),
+        content: TextField(
+          controller: ctrl,
+          decoration: const InputDecoration(
+            labelText: 'Note',
+            border: OutlineInputBorder(),
+          ),
+          maxLines: 3,
+          textInputAction: TextInputAction.newline,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    if (ok != true) return;
+    final t = ctrl.text.trim();
+    if (t.isEmpty) return;
+    await _appendNote(t);
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Note added')));
+  }
+
+  // Centralised: decide what number should show when landing on a paddock
+  int _coverForPaddock(String paddockId) {
+    // 1) Draft (what you've typed this session)
+    final d = draftCover[paddockId];
+    if (d != null) return d;
+
+    // 2) If there's a measurement today already, use it
+    final lm = lastMeasured[paddockId];
+    final now = DateTime.now();
+    if (lm != null && _sameDay(lm.at, now)) return lm.cover;
+
+    // 3) Otherwise predicted
+    return predictedNow[paddockId] ?? 2500;
+  }
+
+  void _setCurrentCover(int v) {
+    final clamped = clampCover(v);
+    setState(() {
+      currentCover = clamped;
+
+      // ✅ Always store draft as you type/adjust so it "sticks"
+      draftCover[_p.id] = clamped;
+    });
+  }
 
   Future<void> _saveCurrent() async {
+    // ✅ Save whatever is currently on screen (draft already updated)
     final m = Measurement(
       id: uuid.v4(),
       paddockId: _p.id,
@@ -101,22 +341,10 @@ class _RoundScreenState extends State<RoundScreen> {
     );
 
     await storage.upsertMeasurementForToday(m);
+
+    // keep in-memory caches in sync
     lastMeasured[_p.id] = m;
-  }
-
-  Future<void> _addNote(String title) async {
-    final n = NoteEntry(
-      id: uuid.v4(),
-      paddockId: _p.id,
-      at: DateTime.now(),
-      title: title,
-    );
-    await storage.appendNote(n);
-
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Note added: $title')),
-    );
+    draftCover[_p.id] = currentCover;
   }
 
   Future<void> _finish() async {
@@ -130,7 +358,7 @@ class _RoundScreenState extends State<RoundScreen> {
     if (idx < order.length - 1) {
       setState(() {
         idx++;
-        currentCover = predictedNow[_p.id] ?? currentCover;
+        currentCover = _coverForPaddock(_p.id); // ✅ use draft/today/predicted
       });
     }
   }
@@ -140,52 +368,22 @@ class _RoundScreenState extends State<RoundScreen> {
     if (idx > 0) {
       setState(() {
         idx--;
-        currentCover = predictedNow[_p.id] ?? currentCover;
-      });
-    }
-  }
-
-  void _skip() {
-    if (idx < order.length - 1) {
-      setState(() {
-        idx++;
-        currentCover = predictedNow[_p.id] ?? currentCover;
+        currentCover = _coverForPaddock(_p.id); // ✅ use draft/today/predicted
       });
     }
   }
 
   void _adjust(int delta) {
-    setState(() {
-      currentCover = clampCover(currentCover + delta);
-    });
-  }
+    final step = delta.abs(); // 50 or 100
+    final isIncrease = delta > 0;
 
-  Future<void> _enterExact() async {
-    final ctrl = TextEditingController(text: currentCover.toString());
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Enter cover'),
-        content: TextField(
-          controller: ctrl,
-          keyboardType: TextInputType.number,
-          decoration: const InputDecoration(
-            border: OutlineInputBorder(),
-            isDense: true,
-          ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
-        ],
-      ),
-    );
+    // Always snap to the step boundary so values stay clean (e.g. 100s) even
+    // when the starting cover isn't aligned to the step.
+    final next = isIncrease
+        ? ((currentCover + step) ~/ step) * step
+        : ((currentCover - 1) ~/ step) * step;
 
-    if (ok != true) return;
-    final v = int.tryParse(ctrl.text.trim());
-    if (v != null) {
-      setState(() => currentCover = clampCover(v));
-    }
+    _setCurrentCover(next);
   }
 
   @override
@@ -194,179 +392,333 @@ class _RoundScreenState extends State<RoundScreen> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    if (order.isEmpty) {
-      return Scaffold(
-        appBar: AppBar(title: const Text('Record covers')),
-        body: const Center(
-          child: Text('No paddocks included in rotation.\nEnable them in Settings → Recording order.'),
-        ),
-      );
-    }
-
     final now = DateTime.now();
     final lastCoverText = _last == null ? '—' : _last!.cover.toString();
     final lastDaysAgo = _last == null ? '—' : daysAgoLabel(now, _last!.at);
 
-    final growthLine =
-        '${_gEff.toStringAsFixed(1)}/day (${farmGrowth.toStringAsFixed(1)} × ${_mod.toStringAsFixed(2)})';
+    final growthLine = '${_gEff.toStringAsFixed(1)}/day';
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Record covers')),
+      appBar: AppBar(
+        title: const Text('Record covers'),
+        actions: [TextButton(onPressed: _finish, child: const Text('Finish'))],
+      ),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(14),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Text(
-                'Paddock ${_p.name}',
-                style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
-              ),
-              const SizedBox(height: 10),
-
-              // Top cards
-              Row(
-                children: [
-                  Expanded(
-                    child: _InfoCard(
-                      title: 'Last cover',
-                      value: lastCoverText,
-                      unit: 'kgDM/ha',
-                      meta: lastDaysAgo,
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: _InfoCard(
-                      title: 'Predicted',
-                      value: _pred.toString(),
-                      unit: 'kgDM/ha',
-                      meta: growthLine,
-                    ),
-                  ),
-                ],
-              ),
-
-              // ✅ Note buttons under the cards
-              const SizedBox(height: 10),
               Row(
                 children: [
                   Expanded(
                     child: SizedBox(
-                      height: 44,
+                      height: 46,
                       child: OutlinedButton(
-                        onPressed: () => _addNote(noteBtn1),
-                        child: Text(noteBtn1, maxLines: 1, overflow: TextOverflow.ellipsis),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: SizedBox(
-                      height: 44,
-                      child: OutlinedButton(
-                        onPressed: () => _addNote(noteBtn2),
-                        child: Text(noteBtn2, maxLines: 1, overflow: TextOverflow.ellipsis),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-
-              const Spacer(),
-
-              InkWell(
-                onTap: _enterExact,
-                child: Column(
-                  children: [
-                    Text(
-                      currentCover.toString(),
-                      style: const TextStyle(fontSize: 78, fontWeight: FontWeight.w900),
-                    ),
-                    const Text('kgDM/ha', style: TextStyle(fontSize: 14, color: Colors.black54)),
-                  ],
-                ),
-              ),
-
-              const Spacer(),
-
-              Row(
-                children: [
-                  Expanded(
-                    child: SizedBox(
-                      height: 60,
-                      child: OutlinedButton(
-                        onPressed: () => _adjust(-step),
-                        child: Text('- $step', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: SizedBox(
-                      height: 60,
-                      child: OutlinedButton(
-                        onPressed: () => _adjust(step),
-                        child: Text('+ $step', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-
-              const SizedBox(height: 14),
-
-              // Previous / Skip / Next OR Finish
-              Row(
-                children: [
-                  Expanded(
-                    flex: 5,
-                    child: SizedBox(
-                      height: 72,
-                      child: ElevatedButton(
-                        onPressed: idx == 0 ? null : _prev,
-                        child: const Text(
-                          'Previous',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  SizedBox(
-                    width: 56,
-                    height: 56,
-                    child: OutlinedButton(
-                      style: OutlinedButton.styleFrom(
-                        shape: const CircleBorder(),
-                        padding: EdgeInsets.zero,
-                      ),
-                      onPressed: idx == order.length - 1 ? null : _skip,
-                      child: const Text(
-                        'Skip',
-                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w900),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    flex: 5,
-                    child: SizedBox(
-                      height: 72,
-                      child: ElevatedButton(
-                        onPressed: idx == order.length - 1 ? _finish : _next,
+                        onPressed: () async {
+                          await _appendNote(noteBtn1);
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text('Note added: $noteBtn1')),
+                          );
+                        },
                         child: Text(
-                          idx == order.length - 1 ? 'Finish' : 'Next',
+                          noteBtn1,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: SizedBox(
+                      height: 46,
+                      child: OutlinedButton(
+                        onPressed: () async {
+                          await _appendNote(noteBtn2);
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text('Note added: $noteBtn2')),
+                          );
+                        },
+                        child: Text(
+                          noteBtn2,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: SizedBox(
+                      height: 46,
+                      child: OutlinedButton(
+                        onPressed: _appendCustomNote,
+                        child: const Text(
+                          'Custom',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
                       ),
                     ),
                   ),
                 ],
+              ),
+              const SizedBox(height: 10),
+              Expanded(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onLongPress: () async {
+                    _dismissHints();
+                    await _openNotesSheet();
+                  },
+                  onTapDown: (d) {
+                    final w = context.size?.width ?? 0;
+                    if (w <= 0) return;
+                    final isIncrease = d.localPosition.dx >= (w / 2);
+                    final delta = isIncrease ? coverStep : -coverStep;
+                    _adjust(delta);
+                    _fireTapFeedback(delta);
+                  },
+                  onHorizontalDragEnd: (details) async {
+                    _dismissHints();
+                    final v = details.primaryVelocity ?? 0;
+                    if (v.abs() < 300) return;
+                    if (v < 0) {
+                      await _navNext();
+                    } else {
+                      await _navPrev();
+                    }
+                  },
+                  child: Stack(
+                    children: [
+                      AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 260),
+                        switchInCurve: Curves.easeOut,
+                        switchOutCurve: Curves.easeIn,
+                        transitionBuilder: (child, anim) {
+                          final begin = _lastTapWasIncrease
+                              ? const Offset(0.15, 0)
+                              : const Offset(-0.15, 0);
+                          final slide = Tween<Offset>(
+                            begin: begin,
+                            end: Offset.zero,
+                          ).animate(anim);
+                          return FadeTransition(
+                            opacity: anim,
+                            child: SlideTransition(
+                              position: slide,
+                              child: child,
+                            ),
+                          );
+                        },
+                        child: Column(
+                          key: ValueKey(_p.id),
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            InkWell(
+                              onTap: () async {
+                                _dismissHints();
+                                await _jumpToPaddock();
+                              },
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 2,
+                                ),
+                                child: Text(
+                                  'Paddock ${_p.name}  (${idx + 1}/${order.length})',
+                                  style: const TextStyle(
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.w900,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: _InfoCard(
+                                    title: 'Last cover',
+                                    value: lastCoverText,
+                                    unit: 'kgDM/ha',
+                                    meta: lastDaysAgo,
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: _InfoCard(
+                                    title: 'Predicted',
+                                    value: _pred.toString(),
+                                    unit: 'kgDM/ha',
+                                    meta: growthLine,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const Spacer(),
+                            Column(
+                              children: [
+                                Text(
+                                  currentCover.toString(),
+                                  style: const TextStyle(
+                                    fontSize: 78,
+                                    fontWeight: FontWeight.w900,
+                                  ),
+                                ),
+                                const Text(
+                                  'kgDM/ha',
+                                  style: TextStyle(
+                                    fontSize: 14,
+                                    color: Colors.black54,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const Spacer(),
+                          ],
+                        ),
+                      ),
+                      IgnorePointer(
+                        child: AnimatedBuilder(
+                          animation: _tapCtrl,
+                          builder: (context, _) {
+                            if (_tapCtrl.value <= 0) {
+                              return const SizedBox.shrink();
+                            }
+
+                            final isInc = _lastTapDelta > 0;
+                            final color = isInc ? Colors.green : Colors.red;
+                            final sideAlign = isInc
+                                ? Alignment.centerRight
+                                : Alignment.centerLeft;
+
+                            final overlay = Align(
+                              alignment: sideAlign,
+                              child: FractionallySizedBox(
+                                widthFactor: 0.5,
+                                heightFactor: 1.0,
+                                child: Opacity(
+                                  opacity: 0.25 * (1 - _tapOpacity.value),
+                                  child: Container(color: color),
+                                ),
+                              ),
+                            );
+
+                            final sign = isInc ? '+' : '−';
+                            final txt = '$sign${_lastTapDelta.abs()}';
+                            final dx =
+                                (isInc ? 1 : -1) * (1 - _deltaT.value) * 140;
+                            final dy = (1 - _deltaT.value) * 40;
+                            final floaty = Align(
+                              alignment: Alignment.center,
+                              child: Transform.translate(
+                                offset: Offset(dx, dy),
+                                child: Opacity(
+                                  opacity: 1 - _tapOpacity.value,
+                                  child: Text(
+                                    txt,
+                                    style: TextStyle(
+                                      fontSize: 26,
+                                      fontWeight: FontWeight.w900,
+                                      color: color,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+
+                            return Stack(children: [overlay, floaty]);
+                          },
+                        ),
+                      ),
+                      if (_showHints && idx == 0)
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: AnimatedOpacity(
+                              opacity: 1,
+                              duration: const Duration(milliseconds: 250),
+                              child: Container(
+                                color: Colors.black.withValues(alpha: 0.08),
+                                padding: const EdgeInsets.all(14),
+                                child: Stack(
+                                  children: [
+                                    Align(
+                                      alignment: Alignment.bottomCenter,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 12,
+                                          vertical: 10,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Colors.white,
+                                          borderRadius: BorderRadius.circular(
+                                            14,
+                                          ),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              blurRadius: 18,
+                                              color: Colors.black.withValues(
+                                                alpha: 0.12,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                        child: const Text(
+                                          'Tap left/right to -/+ cover\nSwipe to change paddock\nLong-press for notes\nTap header to jump',
+                                          textAlign: TextAlign.center,
+                                          style: TextStyle(
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w800,
+                                            color: Colors.black87,
+                                            height: 1.25,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    Align(
+                                      alignment: Alignment.centerLeft,
+                                      child: Padding(
+                                        padding: const EdgeInsets.only(
+                                          left: 6.0,
+                                        ),
+                                        child: Text(
+                                          '-$coverStep',
+                                          style: const TextStyle(
+                                            fontSize: 16,
+                                            fontWeight: FontWeight.w900,
+                                            color: Colors.red,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    Align(
+                                      alignment: Alignment.centerRight,
+                                      child: Padding(
+                                        padding: const EdgeInsets.only(
+                                          right: 6.0,
+                                        ),
+                                        child: Text(
+                                          '+$coverStep',
+                                          style: const TextStyle(
+                                            fontSize: 16,
+                                            fontWeight: FontWeight.w900,
+                                            color: Colors.green,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
               ),
             ],
           ),
@@ -393,29 +745,53 @@ class _InfoCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       elevation: 0,
-      color: Colors.black.withOpacity(0.04),
+      color: Colors.black.withValues(alpha: 0.04),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(title, style: const TextStyle(fontSize: 12, color: Colors.black54, fontWeight: FontWeight.w700)),
+            Text(
+              title,
+              style: const TextStyle(
+                fontSize: 12,
+                color: Colors.black54,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
             const SizedBox(height: 6),
             Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
-                Text(value, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900)),
+                Text(
+                  value,
+                  style: const TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
                 const SizedBox(width: 6),
                 Padding(
                   padding: const EdgeInsets.only(bottom: 2),
-                  child: Text(unit, style: const TextStyle(fontSize: 11, color: Colors.black54, fontWeight: FontWeight.w700)),
+                  child: Text(
+                    unit,
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: Colors.black54,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
                 ),
               ],
             ),
             const SizedBox(height: 6),
             Text(
               meta,
-              style: const TextStyle(fontSize: 11, color: Colors.black45, fontWeight: FontWeight.w600),
+              style: const TextStyle(
+                fontSize: 11,
+                color: Colors.black45,
+                fontWeight: FontWeight.w600,
+              ),
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
             ),

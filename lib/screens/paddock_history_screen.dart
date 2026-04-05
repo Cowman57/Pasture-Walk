@@ -17,7 +17,7 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
   final storage = Storage();
   late final TabController _tabs;
 
-  int? annualHarvestKgDm;
+  double? annualHarvestKgDmPerHa;
 
   @override
   void initState() {
@@ -27,9 +27,13 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
   }
 
   Future<void> _loadAnnualHarvest() async {
-    final v = await storage.annualHarvestKgDmForPaddock(widget.paddock.id);
+    final total = await storage.annualHarvestKgDmForPaddock(widget.paddock.id);
+    final area = widget.paddock.areaHa;
+
+    final perHa = (area <= 0) ? 0.0 : (total / area);
+
     if (!mounted) return;
-    setState(() => annualHarvestKgDm = v);
+    setState(() => annualHarvestKgDmPerHa = perHa);
   }
 
   @override
@@ -39,26 +43,48 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
   }
 
   String _fmtDateShort(DateTime d) {
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
     final dd = d.day.toString().padLeft(2, '0');
     return '$dd ${months[d.month - 1]}';
   }
 
   String _fmtDateLong(DateTime d) {
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
     final dd = d.day.toString().padLeft(2, '0');
     return '$dd ${months[d.month - 1]} ${d.year}';
   }
 
-  String _fmtInt(int n) {
-    final s = n.toString();
-    final buf = StringBuffer();
-    for (int i = 0; i < s.length; i++) {
-      final idxFromEnd = s.length - i;
-      buf.write(s[i]);
-      if (idxFromEnd > 1 && idxFromEnd % 3 == 1) buf.write(',');
-    }
-    return buf.toString();
+  String _harvestPerHaText(Grazing g) {
+    final area = widget.paddock.areaHa;
+    if (area <= 0) return '—';
+    final perHa = g.harvestedKgDm / area;
+    return perHa.toStringAsFixed(0); // change to 1 dp if you want
   }
 
   @override
@@ -79,11 +105,7 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
       ),
       body: TabBarView(
         controller: _tabs,
-        children: [
-          _coversTab(),
-          _grazingsTab(),
-          _notesTab(),
-        ],
+        children: [_coversTab(), _grazingsTab(), _notesTab()],
       ),
       bottomNavigationBar: _statsBar(),
     );
@@ -100,7 +122,7 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.04),
+          color: Colors.black.withValues(alpha: 0.04),
           border: const Border(top: BorderSide(color: Colors.black12)),
         ),
         child: Row(
@@ -116,8 +138,10 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
             Expanded(
               child: _statCell(
                 label: 'Annual harvest',
-                value: annualHarvestKgDm == null ? '—' : _fmtInt(annualHarvestKgDm!),
-                unit: 'kgDM',
+                value: annualHarvestKgDmPerHa == null
+                    ? '—'
+                    : annualHarvestKgDmPerHa!.toStringAsFixed(0),
+                unit: 'kgDM/ha',
                 alignLeft: false,
               ),
             ),
@@ -135,16 +159,37 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
   }) {
     return Column(
       mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: alignLeft ? CrossAxisAlignment.start : CrossAxisAlignment.end,
+      crossAxisAlignment: alignLeft
+          ? CrossAxisAlignment.start
+          : CrossAxisAlignment.end,
       children: [
-        Text(label, style: const TextStyle(fontSize: 12, color: Colors.black54, fontWeight: FontWeight.w600)),
+        Text(
+          label,
+          style: const TextStyle(
+            fontSize: 12,
+            color: Colors.black54,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
         const SizedBox(height: 2),
         Row(
-          mainAxisAlignment: alignLeft ? MainAxisAlignment.start : MainAxisAlignment.end,
+          mainAxisAlignment: alignLeft
+              ? MainAxisAlignment.start
+              : MainAxisAlignment.end,
           children: [
-            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+            Text(
+              value,
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+            ),
             const SizedBox(width: 6),
-            Text(unit, style: const TextStyle(fontSize: 12, color: Colors.black54, fontWeight: FontWeight.w700)),
+            Text(
+              unit,
+              style: const TextStyle(
+                fontSize: 12,
+                color: Colors.black54,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
           ],
         ),
       ],
@@ -193,7 +238,7 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
           _HdrCell('Date'),
           _HdrCell('Pre', unit: 'kgDM/ha'),
           _HdrCell('Post', unit: 'kgDM/ha'),
-          _HdrCell('Harvest', unit: 'kgDM'),
+          _HdrCell('Harvest', unit: 'kgDM/ha'),
         ],
       ),
     );
@@ -207,7 +252,7 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
           _Cell(_fmtDateShort(g.at)),
           _Cell(g.preCover.toString()),
           _Cell(g.residual.toString()),
-          _Cell(_fmtInt(g.harvestedKgDm)),
+          _Cell(_harvestPerHaText(g)),
         ],
       ),
     );

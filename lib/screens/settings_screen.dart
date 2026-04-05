@@ -1,15 +1,12 @@
 import 'dart:convert';
-
-import 'dart:convert';
 import 'dart:typed_data';
-import 'package:file_picker/file_picker.dart';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../storage.dart';
 import 'instructions_screen.dart';
-import 'kpis_screen.dart';
-import 'paddock_growth_modifier_screen.dart';
+import 'paddock_import_screen.dart';
 import 'paddock_ranking_screen.dart';
 import 'paddocks_edit_screen.dart';
 import 'recording_order_screen.dart';
@@ -47,34 +44,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _editCoverStep() async {
-    final ctrl = TextEditingController(text: coverStep.toString());
-
-    final ok = await showDialog<bool>(
+    final picked = await showDialog<int>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => SimpleDialog(
         title: const Text('Cover adjust step'),
-        content: TextField(
-          controller: ctrl,
-          keyboardType: TextInputType.number,
-          decoration: const InputDecoration(
-            labelText: 'Step amount',
-            helperText: 'Used for the +/- buttons in cover recording',
-            border: OutlineInputBorder(),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, 50),
+            child: const Text('50 kgDM/ha'),
           ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, 100),
+            child: const Text('100 kgDM/ha'),
+          ),
         ],
       ),
     );
 
-    if (ok != true) return;
+    if (picked == null) return;
 
-    final v = int.tryParse(ctrl.text.trim());
-    if (v == null) return;
-
-    await storage.saveCoverStep(v);
+    await storage.saveCoverStep(picked);
     await _load();
   }
 
@@ -95,8 +84,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Save'),
+          ),
         ],
       ),
     );
@@ -126,21 +121,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
         fileName: 'PastureWalk_backup_$stamp.json',
         type: FileType.custom,
         allowedExtensions: ['json'],
-        bytes: bytes, // ✅ THIS is the key line
+        bytes: bytes,
       );
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Backup saved')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Backup saved')));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Backup failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Backup failed: $e')));
     }
   }
-
 
   Future<void> _restore() async {
     final ok = await showDialog<bool>(
@@ -149,11 +143,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
         title: const Text('Restore backup?'),
         content: const Text(
           'This will overwrite all current data on this phone.\n\n'
-              'Make sure you have a backup first.',
+          'Make sure you have a backup first.',
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Restore')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Restore'),
+          ),
         ],
       ),
     );
@@ -164,33 +164,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
         allowedExtensions: ['json'],
-        withData: true, // ✅ THIS IS THE KEY
+        withData: true,
       );
 
       if (result == null || result.files.isEmpty) return;
 
       final file = result.files.single;
       final bytes = file.bytes;
-      if (bytes == null) {
-        throw Exception('Could not read file data');
-      }
+      if (bytes == null) throw Exception('Could not read file data');
 
       final text = utf8.decode(bytes);
       await storage.restoreBackupJson(text);
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Restore complete. Go back to Home to refresh.')),
+        const SnackBar(
+          content: Text('Restore complete. Go back to Home to refresh.'),
+        ),
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Restore failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Restore failed: $e')));
     }
   }
-
-
 
   @override
   Widget build(BuildContext context) {
@@ -210,18 +208,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: const Text('Restore backup'),
             subtitle: const Text('Load data from a backup file'),
             onTap: _restore,
-          ),
-
-          const Divider(height: 32),
-
-          const _SectionHeader('Insights'),
-          ListTile(
-            leading: const Icon(Icons.insights),
-            title: const Text('KPIs'),
-            subtitle: const Text('Growth, cover, round length, problem paddocks'),
-            onTap: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const KPIsScreen()),
-            ),
           ),
 
           const Divider(height: 32),
@@ -252,18 +238,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           const Divider(height: 32),
 
-          const _SectionHeader('Growth'),
+          const _SectionHeader('Paddocks'),
           ListTile(
-            leading: const Icon(Icons.tune),
-            title: const Text('Paddock growth modifiers'),
+            leading: const Icon(Icons.file_upload),
+            title: const Text('Import paddocks'),
+            subtitle: const Text('Import GeoJSON paddocks'),
             onTap: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const PaddockGrowthModifierScreen()),
+              MaterialPageRoute(builder: (_) => const PaddockImportScreen()),
             ),
           ),
-
-          const Divider(height: 32),
-
-          const _SectionHeader('Paddocks'),
           ListTile(
             leading: const Icon(Icons.grass),
             title: const Text('Add / edit paddocks'),
@@ -287,11 +270,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
 
           const Divider(height: 32),
+
           const _SectionHeader('Help'),
           ListTile(
             leading: const Icon(Icons.help_outline),
             title: const Text('Instructions'),
-            subtitle: const Text('How it works, how to use it, growth calculations'),
+            subtitle: const Text(
+              'How it works, how to use it, growth calculations',
+            ),
             onTap: () => Navigator.of(context).push(
               MaterialPageRoute(builder: (_) => const InstructionsScreen()),
             ),

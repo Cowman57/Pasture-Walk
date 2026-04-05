@@ -19,11 +19,21 @@ class Storage {
   static const _grazingsKey = 'grazings';
   static const _modifiersKey = 'growth_modifiers';
   static const _notesKey = 'notes';
+  static const _hiddenSummaryNoteIdsKey = 'hidden_summary_note_ids';
+
+  // Manual override keys
+  static const _manualFarmGrowthKey = 'manual_farm_growth_kgdm_ha_day';
 
   // Settings keys
   static const _coverStepKey = 'cover_step';
   static const _noteBtn1Key = 'note_btn_1_title';
   static const _noteBtn2Key = 'note_btn_2_title';
+  static const _feedWedgePreTargetKey = 'feed_wedge_pre_target';
+  static const _feedWedgePostResidualTargetKey =
+      'feed_wedge_post_residual_target';
+  static const _areaGrazedPerDayHaKey = 'area_grazed_per_day_ha';
+  static const _coverTrendTimescaleKey = 'cover_trend_timescale';
+  static const _cowCountKey = 'cow_count';
 
   // -----------------------------
   // SETTINGS
@@ -31,13 +41,14 @@ class Storage {
   Future<int> loadCoverStep() async {
     final sp = await SharedPreferences.getInstance();
     final v = sp.getInt(_coverStepKey);
-    if (v == null) return 50;
-    return v.clamp(1, 500);
+    if (v == 100) return 100;
+    return 50; // default
   }
 
   Future<void> saveCoverStep(int step) async {
     final sp = await SharedPreferences.getInstance();
-    await sp.setInt(_coverStepKey, step.clamp(1, 500));
+    final safe = (step == 100) ? 100 : 50;
+    await sp.setInt(_coverStepKey, safe);
   }
 
   Future<String> loadNoteButton1Title() async {
@@ -52,12 +63,98 @@ class Storage {
 
   Future<void> saveNoteButton1Title(String title) async {
     final sp = await SharedPreferences.getInstance();
-    await sp.setString(_noteBtn1Key, title.trim().isEmpty ? 'Weeds' : title.trim());
+    await sp.setString(
+      _noteBtn1Key,
+      title.trim().isEmpty ? 'Weeds' : title.trim(),
+    );
   }
 
   Future<void> saveNoteButton2Title(String title) async {
     final sp = await SharedPreferences.getInstance();
-    await sp.setString(_noteBtn2Key, title.trim().isEmpty ? 'Water leak' : title.trim());
+    await sp.setString(
+      _noteBtn2Key,
+      title.trim().isEmpty ? 'Water leak' : title.trim(),
+    );
+  }
+
+  Future<int> loadFeedWedgePreGrazingTarget() async {
+    final sp = await SharedPreferences.getInstance();
+    return sp.getInt(_feedWedgePreTargetKey) ?? 2800;
+  }
+
+  Future<void> saveFeedWedgePreGrazingTarget(int v) async {
+    final sp = await SharedPreferences.getInstance();
+    final safe = v.clamp(0, 999999999);
+    await sp.setInt(_feedWedgePreTargetKey, safe);
+  }
+
+  Future<int> loadFeedWedgePostGrazingResidualTarget() async {
+    final sp = await SharedPreferences.getInstance();
+    return sp.getInt(_feedWedgePostResidualTargetKey) ?? 1500;
+  }
+
+  Future<void> saveFeedWedgePostGrazingResidualTarget(int v) async {
+    final sp = await SharedPreferences.getInstance();
+    final safe = v.clamp(0, 999999999);
+    await sp.setInt(_feedWedgePostResidualTargetKey, safe);
+  }
+
+  Future<double> loadAreaGrazedPerDayHa() async {
+    final sp = await SharedPreferences.getInstance();
+    return sp.getDouble(_areaGrazedPerDayHaKey) ?? 0.0;
+  }
+
+  Future<void> saveAreaGrazedPerDayHa(double v) async {
+    final sp = await SharedPreferences.getInstance();
+    final safe = v.isFinite ? v : 0.0;
+    await sp.setDouble(_areaGrazedPerDayHaKey, safe.clamp(0.0, 999999999.0));
+  }
+
+  Future<String> loadCoverTrendTimescale() async {
+    final sp = await SharedPreferences.getInstance();
+    final v = sp.getString(_coverTrendTimescaleKey);
+    if (v == 'week' || v == 'month') return v!;
+    return 'day';
+  }
+
+  Future<void> saveCoverTrendTimescale(String v) async {
+    final sp = await SharedPreferences.getInstance();
+    final safe = (v == 'week' || v == 'month') ? v : 'day';
+    await sp.setString(_coverTrendTimescaleKey, safe);
+  }
+
+  Future<int> loadCowCount() async {
+    final sp = await SharedPreferences.getInstance();
+    final v = sp.getInt(_cowCountKey);
+    return (v == null || v < 0) ? 0 : v;
+  }
+
+  Future<void> saveCowCount(int v) async {
+    final sp = await SharedPreferences.getInstance();
+    final safe = v.clamp(0, 999999999);
+    await sp.setInt(_cowCountKey, safe);
+  }
+
+  Future<double?> loadManualFarmGrowthKgDmPerHaPerDay() async {
+    final sp = await SharedPreferences.getInstance();
+    final v = sp.getDouble(_manualFarmGrowthKey);
+    return v;
+  }
+
+  Future<void> saveManualFarmGrowthKgDmPerHaPerDay(double v) async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setDouble(_manualFarmGrowthKey, v);
+  }
+
+  Future<void> clearManualFarmGrowthKgDmPerHaPerDay() async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.remove(_manualFarmGrowthKey);
+  }
+
+  Future<double> effectiveFarmGrowthKgDmPerHaPerDay() async {
+    final manual = await loadManualFarmGrowthKgDmPerHaPerDay();
+    if (manual != null) return manual;
+    return computeFarmGrowthKgDmPerHaPerDay();
   }
 
   // -----------------------------
@@ -91,6 +188,17 @@ class Storage {
     return paddocks.where((p) => p.includeInRotation).map((p) => p.id).toSet();
   }
 
+  Future<Measurement?> _previousMeasurementBefore(
+    String paddockId,
+    DateTime at,
+  ) async {
+    final all = await _loadMeasurements();
+    final list =
+        all.where((m) => m.paddockId == paddockId && m.at.isBefore(at)).toList()
+          ..sort((a, b) => b.at.compareTo(a.at));
+    return list.isEmpty ? null : list.first;
+  }
+
   // -----------------------------
   // MEASUREMENTS
   // -----------------------------
@@ -113,6 +221,9 @@ class Storage {
   /// KPIs helper: raw load all
   Future<List<Measurement>> loadAllMeasurements() async => _loadMeasurements();
 
+  /// Helper: raw load all notes
+  Future<List<NoteEntry>> loadAllNotes() async => _loadNotes();
+
   Future<List<Measurement>> measurementsForPaddock(String paddockId) async {
     final all = await _loadMeasurements();
     return all.where((m) => m.paddockId == paddockId).toList()
@@ -125,19 +236,35 @@ class Storage {
   }
 
   /// Implicit anchor = last measurement OR last grazing residual
-  Future<_Anchor?> latestAnchorForPaddock(String paddockId) async {
-    final m = await lastMeasurementForPaddock(paddockId);
-    final g = await _lastGrazingForPaddock(paddockId);
+  Future<Anchor?> latestAnchorForPaddock(String paddockId) async {
+    return latestAnchorForPaddockAsOf(paddockId, DateTime.now());
+  }
 
-    if (m == null && g == null) return null;
-    if (m != null && g == null) return _Anchor(m.at, m.cover);
-    if (g != null && m == null) return _Anchor(g.at, g.residual);
+  Future<Anchor?> latestAnchorForPaddockAsOf(
+    String paddockId,
+    DateTime asOf,
+  ) async {
+    final allM = await measurementsForPaddock(paddockId);
+    final m = allM.where((x) => !x.at.isAfter(asOf)).toList()
+      ..sort((a, b) => b.at.compareTo(a.at));
+    final m0 = m.isEmpty ? null : m.first;
 
-    return m!.at.isAfter(g!.at) ? _Anchor(m.at, m.cover) : _Anchor(g.at, g.residual);
+    final g0 = await _lastGrazingForPaddockAsOf(paddockId, asOf);
+
+    if (m0 == null && g0 == null) return null;
+    if (m0 != null && g0 == null) return Anchor(m0.at, m0.cover);
+    if (g0 != null && m0 == null) return Anchor(g0.at, g0.residual);
+
+    return m0!.at.isAfter(g0!.at)
+        ? Anchor(m0.at, m0.cover)
+        : Anchor(g0.at, g0.residual);
   }
 
   /// Overwrites measurement for today if present
   Future<void> upsertMeasurementForToday(Measurement m) async {
+    // ✅ capture previous measurement BEFORE we overwrite today
+    final prev = await _previousMeasurementBefore(m.paddockId, m.at);
+
     final all = await _loadMeasurements();
     final today = DateTime.now();
 
@@ -145,11 +272,10 @@ class Storage {
     all.add(m);
     await _saveMeasurements(all);
 
-    // Only learn modifiers for included paddocks
-    final included = await isPaddockIncludedInRotation(m.paddockId);
-    if (included) {
-      await _updateGrowthModifierFromMeasurement(m);
-    }
+    // Growth modifiers are no longer used.
+    // Kept `prev` capture for potential future features.
+    // ignore: unused_local_variable
+    final _ = prev;
   }
 
   // -----------------------------
@@ -165,13 +291,37 @@ class Storage {
 
   Future<void> _saveNotes(List<NoteEntry> ns) async {
     final sp = await SharedPreferences.getInstance();
-    await sp.setString(_notesKey, jsonEncode(ns.map((n) => n.toMap()).toList()));
+    await sp.setString(
+      _notesKey,
+      jsonEncode(ns.map((n) => n.toMap()).toList()),
+    );
   }
 
   Future<void> appendNote(NoteEntry n) async {
     final all = await _loadNotes();
     all.add(n);
     await _saveNotes(all);
+  }
+
+  Future<Set<String>> loadHiddenSummaryNoteIds() async {
+    final sp = await SharedPreferences.getInstance();
+    final list = sp.getStringList(_hiddenSummaryNoteIdsKey) ?? <String>[];
+    return list.map((e) => e.toString()).toSet();
+  }
+
+  Future<void> hideSummaryNoteId(String noteId) async {
+    final sp = await SharedPreferences.getInstance();
+    final cur = sp.getStringList(_hiddenSummaryNoteIdsKey) ?? <String>[];
+    if (cur.contains(noteId)) return;
+    final next = [...cur, noteId];
+    await sp.setStringList(_hiddenSummaryNoteIdsKey, next);
+  }
+
+  Future<void> unhideSummaryNoteId(String noteId) async {
+    final sp = await SharedPreferences.getInstance();
+    final cur = sp.getStringList(_hiddenSummaryNoteIdsKey) ?? <String>[];
+    final next = cur.where((x) => x != noteId).toList();
+    await sp.setStringList(_hiddenSummaryNoteIdsKey, next);
   }
 
   Future<List<NoteEntry>> notesForPaddock(String paddockId) async {
@@ -209,29 +359,35 @@ class Storage {
     );
   }
 
-  Future<Grazing?> _lastGrazingForPaddock(String paddockId) async {
+  Future<Grazing?> _lastGrazingForPaddockAsOf(
+    String paddockId,
+    DateTime asOf,
+  ) async {
     final g = await _loadGrazings();
-    final list = g.where((x) => x.paddockId == paddockId).toList()
-      ..sort((a, b) => b.at.compareTo(a.at));
+    final list =
+        g.where((x) => x.paddockId == paddockId && !x.at.isAfter(asOf)).toList()
+          ..sort((a, b) => b.at.compareTo(a.at));
     return list.isEmpty ? null : list.first;
   }
 
   Future<bool> isCurrentlyGrazed(String paddockId) async {
-    final g = await _lastGrazingForPaddock(paddockId);
+    final g = await _lastGrazingForPaddockAsOf(paddockId, DateTime.now());
     if (g == null) return false;
     return DateTime.now().difference(g.at).inDays < 3;
   }
 
   Future<int> undoLatestGrazingsForPaddocks(
-      Set<String> paddockIds, {
-        required int withinHours,
-      }) async {
+    Set<String> paddockIds, {
+    required int withinHours,
+  }) async {
     final all = await _loadGrazings();
     final cutoff = DateTime.now().subtract(Duration(hours: withinHours));
 
     final before = all.length;
 
-    all.removeWhere((g) => paddockIds.contains(g.paddockId) && g.at.isAfter(cutoff));
+    all.removeWhere(
+      (g) => paddockIds.contains(g.paddockId) && g.at.isAfter(cutoff),
+    );
 
     final sp = await SharedPreferences.getInstance();
     await sp.setString(
@@ -256,19 +412,60 @@ class Storage {
     final msAll = await _loadMeasurements();
     if (msAll.length < 2) return 0;
 
+    // Only included paddocks
     final includedIds = await _includedPaddockIds();
     final ms = msAll.where((m) => includedIds.contains(m.paddockId)).toList();
     if (ms.length < 2) return 0;
 
-    ms.sort((a, b) => a.at.compareTo(b.at));
+    // Group measurements by paddock
+    final byPdk = <String, List<Measurement>>{};
+    for (final m in ms) {
+      (byPdk[m.paddockId] ??= []).add(m);
+    }
 
-    final last = ms.last;
-    final prev = ms[ms.length - 2];
+    final rates = <double>[];
 
-    final days = last.at.difference(prev.at).inDays;
-    if (days <= 0) return 0;
+    // For each paddock: find the most recent valid measurement-to-measurement segment
+    // where NO grazing occurred between the two measurements.
+    for (final entry in byPdk.entries) {
+      final paddockId = entry.key;
+      final list = entry.value..sort((a, b) => a.at.compareTo(b.at));
+      if (list.length < 2) continue;
 
-    return (last.cover - prev.cover) / days;
+      // Start from the latest measurement and walk backwards until we find a valid "prev"
+      final cur = list.last;
+
+      for (int i = list.length - 2; i >= 0; i--) {
+        final prev = list[i];
+
+        final daysDiff = cur.at.difference(prev.at).inDays;
+        if (daysDiff <= 0) continue;
+
+        // Skip segments that include a grazing event (resets cover)
+        final grazedBetween = await paddockGrazedBetween(
+          paddockId,
+          prev.at,
+          cur.at,
+        );
+        if (grazedBetween) continue;
+
+        final rate = (cur.cover - prev.cover) / daysDiff;
+
+        // Ignore paddocks that have decreased in cover (often grazed / not representative).
+        if (rate <= 0) continue;
+
+        rates.add(rate);
+        break; // only use most recent valid segment for this paddock
+      }
+    }
+
+    if (rates.isEmpty) return 0;
+
+    final avg = rates.reduce((a, b) => a + b) / rates.length;
+
+    // If you never want negative farm growth in prediction, clamp it here:
+    // return avg < 0 ? 0 : avg;
+    return avg;
   }
 
   // -----------------------------
@@ -287,43 +484,14 @@ class Storage {
     await sp.setString(_modifiersKey, jsonEncode(m));
   }
 
-  Future<void> _updateGrowthModifierFromMeasurement(Measurement m) async {
-    final farmGrowth = await computeFarmGrowthKgDmPerHaPerDay();
-    if (farmGrowth.abs() < 1) return;
-
-    final prev = await lastMeasurementForPaddock(m.paddockId);
-    if (prev == null) return;
-
-    final days = m.at.difference(prev.at).inDays;
-    if (days < 2) return;
-
-    if (await paddockGrazedBetween(m.paddockId, prev.at, m.at)) return;
-
-    final error = m.cover - m.predictedCoverAtEntry;
-    final deltaPerDay = error / days;
-    final modifierDelta = deltaPerDay / farmGrowth;
-
-    final mods = await loadGrowthModifiers();
-    final old = mods[m.paddockId] ?? 1.0;
-
-    // EMA smoothing
-    final learned = 1 + modifierDelta;
-    final updated = old * 0.9 + learned * 0.1;
-
-    mods[m.paddockId] = updated.clamp(0.7, 1.3);
-    await saveGrowthModifiers(mods);
-  }
-
-  // -----------------------------
   // HISTORY / RANKING HELPERS
   // -----------------------------
   Future<int> annualHarvestKgDmForPaddock(String paddockId) async {
     final g = await _loadGrazings();
     final year = DateTime.now().year;
-    return g.where((x) => x.paddockId == paddockId && x.at.year == year).fold<int>(
-      0,
-          (a, b) => a + b.harvestedKgDm,
-    );
+    return g
+        .where((x) => x.paddockId == paddockId && x.at.year == year)
+        .fold<int>(0, (a, b) => a + b.harvestedKgDm);
   }
 
   Future<Map<String, int>> annualHarvestAllPaddocksKgDm() async {
@@ -394,7 +562,11 @@ class Storage {
     return {'t': 'string', 'v': v.toString()};
   }
 
-  Future<void> _applyPrefValue(SharedPreferences sp, String key, dynamic encoded) async {
+  Future<void> _applyPrefValue(
+    SharedPreferences sp,
+    String key,
+    dynamic encoded,
+  ) async {
     if (encoded is Map<String, dynamic>) {
       final t = encoded['t'];
       final v = encoded['v'];
@@ -415,7 +587,8 @@ class Storage {
           await sp.setString(key, (v as String?) ?? '');
           return;
         case 'stringList':
-          final list = (v as List?)?.map((e) => e.toString()).toList() ?? <String>[];
+          final list =
+              (v as List?)?.map((e) => e.toString()).toList() ?? <String>[];
           await sp.setStringList(key, list);
           return;
         default:
@@ -443,21 +616,24 @@ class Storage {
   // -----------------------------
   // HELPERS
   // -----------------------------
-  bool _sameDay(DateTime a, DateTime b) => a.year == b.year && a.month == b.month && a.day == b.day;
+  bool _sameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
 
   Future<bool> paddockGrazedBetween(
-      String paddockId,
-      DateTime a,
-      DateTime b,
-      ) async {
+    String paddockId,
+    DateTime a,
+    DateTime b,
+  ) async {
     final g = await _loadGrazings();
-    return g.any((x) => x.paddockId == paddockId && x.at.isAfter(a) && x.at.isBefore(b));
+    return g.any(
+      (x) => x.paddockId == paddockId && x.at.isAfter(a) && x.at.isBefore(b),
+    );
   }
 }
 
-class _Anchor {
+class Anchor {
   final DateTime at;
   final int coverKgDmHa;
 
-  _Anchor(this.at, this.coverKgDmHa);
+  Anchor(this.at, this.coverKgDmHa);
 }
