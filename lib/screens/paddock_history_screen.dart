@@ -17,6 +17,9 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
   final storage = Storage();
   late final TabController _tabs;
 
+  static const int _minCoverBar = 1200;
+  static const int _maxCoverBar = 3200;
+
   double? annualHarvestKgDmPerHa;
 
   @override
@@ -279,13 +282,55 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
           separatorBuilder: (_, __) => const Divider(height: 1),
           itemBuilder: (ctx, i) {
             final m = ms[i];
-            return ListTile(
-              title: Text('${m.cover} kgDM/ha'),
-              subtitle: Text(_fmtDateLong(m.at)),
-            );
+            return _coverRow(m);
           },
         );
       },
+    );
+  }
+
+  Widget _coverRow(Measurement m) {
+    final denom = (_maxCoverBar - _minCoverBar);
+    final clamped = m.cover.clamp(_minCoverBar, _maxCoverBar);
+    final t = denom <= 0 ? 0.0 : ((clamped - _minCoverBar) / denom);
+
+    return SizedBox(
+      height: 56,
+      child: LayoutBuilder(
+        builder: (ctx, constraints) {
+          final barW = constraints.maxWidth * t;
+          return Stack(
+            fit: StackFit.expand,
+            children: [
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Container(
+                  width: barW,
+                  color: Colors.green.withValues(alpha: 0.18),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${m.cover} kgDM/ha',
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      _fmtDateLong(m.at),
+                      style: const TextStyle(color: Colors.black54),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          );
+        },
+      ),
     );
   }
 

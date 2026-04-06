@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:proj4dart/proj4dart.dart' as proj4;
 
 import '../models.dart';
 import '../storage.dart';
@@ -16,6 +18,18 @@ class _RoundScreenState extends State<RoundScreen>
     with SingleTickerProviderStateMixin {
   final storage = Storage();
   final uuid = const Uuid();
+
+  bool _gpsExcludedWarned = false;
+
+  late final proj4.Projection _wgs84 =
+      proj4.Projection.get('EPSG:4326') ?? proj4.Projection.WGS84;
+
+  late final proj4.Projection _nztm =
+      proj4.Projection.get('EPSG:2193') ??
+      proj4.Projection.add(
+        'EPSG:2193',
+        '+proj=tmerc +lat_0=0 +lon_0=173 +k=0.9996 +x_0=1600000 +y_0=10000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs',
+      );
 
   bool loaded = false;
 
@@ -250,8 +264,155 @@ class _RoundScreenState extends State<RoundScreen>
     }
     coverStep = await storage.loadCoverStep();
 
+    await _maybeGpsJumpToCurrentPaddock();
+
     loaded = true;
     if (mounted) setState(() {});
+  }
+
+  Future<void> _maybeGpsJumpToCurrentPaddock() async {
+    if (order.isEmpty) return;
+
+    final gpsEnabled = await storage.loadGpsMeasuringEnabled();
+    if (!gpsEnabled) return;
+
+    final hasMap = await storage.hasFarmMap();
+    if (!hasMap) return;
+
+    final svc = await Geolocator.isLocationServiceEnabled();
+    if (!svc) return;
+
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+    if (perm == LocationPermission.denied ||
+        perm == LocationPermission.deniedForever) {
+      return;
+    }
+
+    Position pos;
+    try {
+      pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+    } catch (_) {
+      return;
+    }
+
+    final lat = pos.latitude;
+    final lon = pos.longitude;
+
+    final polysRaw = await storage.loadFarmMapPolygons();
+    if (polysRaw.isEmpty) return;
+
+    final allPaddocks = await storage.loadPaddocks();
+    final paddockById = {for (final p in allPaddocks) p.id: p};
+
+    final orderById = {for (final p in order) p.id: p};
+
+    String? hit;
+    for (final pr in polysRaw) {
+      final paddockId = pr['paddockId']?.toString();
+      if (paddockId == null || paddockId.isEmpty) continue;
+
+      final meta = paddockById[paddockId];
+
+      final ringsAny = pr['polys'];
+      if (ringsAny is! List) continue;
+      for (final ringAny in ringsAny) {
+        final ring = _ringToLatLon(ringAny);
+        if (ring == null || ring.length < 3) continue;
+        if (_pointInRing(lat: lat, lon: lon, ring: ring)) {
+          if (meta != null && !meta.includeInRotation) {
+            if (!_gpsExcludedWarned && mounted) {
+              _gpsExcludedWarned = true;
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('GPS: ${meta.name} is excluded')),
+              );
+            }
+            return;
+          }
+
+          if (!orderById.containsKey(paddockId)) {
+            // Inside a paddock that isn't in the current round (e.g. excluded or not in rotation list)
+            return;
+          }
+          hit = paddockId;
+          break;
+        }
+      }
+      if (hit != null) break;
+    }
+
+    if (hit == null) return;
+    final newIdx = order.indexWhere((p) => p.id == hit);
+    if (newIdx < 0 || newIdx == idx) return;
+    if (!mounted) return;
+    setState(() {
+      idx = newIdx;
+      currentCover = _coverForPaddock(order[idx].id);
+    });
+  }
+
+  List<List<double>>? _ringToLatLon(dynamic ringAny) {
+    if (ringAny is! List) return null;
+    final out = <List<double>>[];
+    for (final xyAny in ringAny) {
+      if (xyAny is! List) continue;
+      if (xyAny.length < 2) continue;
+      final a = (xyAny[0] as num?)?.toDouble();
+      final b = (xyAny[1] as num?)?.toDouble();
+      if (a == null || b == null) continue;
+
+      // Prefer [lon, lat]
+      double lon = a;
+      double lat = b;
+      final degOk = (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180);
+      if (!degOk) {
+        final swappedDegOk = (a >= -90 && a <= 90 && b >= -180 && b <= 180);
+        if (swappedDegOk) {
+          lat = a;
+          lon = b;
+        } else {
+          final looksProjected = a.abs() > 1000 && b.abs() > 1000;
+          if (!looksProjected) return null;
+          try {
+            final pWgs = _nztm.transform(_wgs84, proj4.Point(x: a, y: b));
+            lon = pWgs.x.toDouble();
+            lat = pWgs.y.toDouble();
+            if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+          } catch (_) {
+            return null;
+          }
+        }
+      }
+
+      out.add([lat, lon]);
+    }
+    return out;
+  }
+
+  bool _pointInRing({
+    required double lat,
+    required double lon,
+    required List<List<double>> ring,
+  }) {
+    bool inside = false;
+    for (int i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      final yi = ring[i][0];
+      final xi = ring[i][1];
+      final yj = ring[j][0];
+      final xj = ring[j][1];
+
+      final intersect =
+          ((yi > lat) != (yj > lat)) &&
+          (lon <
+              (xj - xi) * (lat - yi) / ((yj - yi) == 0 ? 1e-12 : (yj - yi)) +
+                  xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
   }
 
   Paddock get _p => order[idx];
