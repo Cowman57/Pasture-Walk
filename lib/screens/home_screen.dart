@@ -1159,7 +1159,7 @@ class _HomeScreenState extends State<HomeScreen> {
         SizedBox(
           width: double.infinity,
           height: 64,
-          child: ElevatedButton(
+          child: FilledButton(
             onPressed: () async {
               await Navigator.of(
                 context,
@@ -1167,7 +1167,7 @@ class _HomeScreenState extends State<HomeScreen> {
               await _refreshHome();
             },
             child: const Text(
-              'Start / Resume Recording',
+              'Start Recording Covers',
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
             ),
           ),

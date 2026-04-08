@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart' as ll;
 import 'package:proj4dart/proj4dart.dart' as proj4;
+import 'dart:async';
 
 import '../models.dart';
 import '../storage.dart';
@@ -18,6 +21,24 @@ class _RoundScreenState extends State<RoundScreen>
     with SingleTickerProviderStateMixin {
   final storage = Storage();
   final uuid = const Uuid();
+
+  static const double _overlayBoxAlpha = 0.80;
+  Color get _overlayBoxColor =>
+      Colors.grey.shade300.withValues(alpha: _overlayBoxAlpha);
+
+  final MapController _mapController = MapController();
+  double _mapZoom = 16;
+
+  Timer? _mapPanTimer;
+  ll.LatLng? _mapCenter;
+
+  StreamSubscription<Position>? _posSub;
+  bool _gpsLiveEnabled = false;
+  bool _gpsTrackingActive = false;
+  bool _bgHasMap = false;
+  Position? _lastPos;
+  List<Map<String, dynamic>> _farmPolysRaw = const [];
+  DateTime? _gpsLastSwitchAt;
 
   bool _gpsExcludedWarned = false;
 
@@ -42,6 +63,9 @@ class _RoundScreenState extends State<RoundScreen>
   bool _lastTapWasIncrease = true;
 
   bool _showHints = true;
+
+  double _hDragDx = 0.0;
+  bool _hDragHandled = false;
 
   List<Paddock> order = [];
   int idx = 0;
@@ -79,6 +103,9 @@ class _RoundScreenState extends State<RoundScreen>
 
   @override
   void dispose() {
+    _posSub?.cancel();
+    _gpsTrackingActive = false;
+    _mapPanTimer?.cancel();
     _tapCtrl.dispose();
     super.dispose();
   }
@@ -192,6 +219,7 @@ class _RoundScreenState extends State<RoundScreen>
       idx = picked;
       currentCover = _coverForPaddock(_p.id);
     });
+    _panToSelectedPaddock(animate: true);
   }
 
   void _fireTapFeedback(int delta) {
@@ -264,10 +292,254 @@ class _RoundScreenState extends State<RoundScreen>
     }
     coverStep = await storage.loadCoverStep();
 
+    await _maybeLoadFarmMapForBackground();
+
     await _maybeGpsJumpToCurrentPaddock();
+    await _maybeStartGpsLiveTracking();
 
     loaded = true;
     if (mounted) setState(() {});
+  }
+
+  Future<void> _maybeLoadFarmMapForBackground() async {
+    final hasMap = await storage.hasFarmMap();
+    _bgHasMap = hasMap;
+    if (!hasMap) return;
+
+    final polysRaw = await storage.loadFarmMapPolygons();
+    if (polysRaw.isEmpty) return;
+    _farmPolysRaw = polysRaw;
+
+    _panToSelectedPaddock(animate: false);
+
+    if (mounted) setState(() {});
+  }
+
+  ll.LatLng? _centerForPaddockId(String paddockId) {
+    if (_farmPolysRaw.isEmpty) return null;
+
+    for (final pr in _farmPolysRaw) {
+      final id = pr['paddockId']?.toString();
+      if (id != paddockId) continue;
+      final ringsAny = pr['polys'];
+      if (ringsAny is! List || ringsAny.isEmpty) return null;
+      final ring = _ringToLatLon(ringsAny.first);
+      if (ring == null || ring.length < 3) return null;
+
+      double minLat = 1e30;
+      double minLon = 1e30;
+      double maxLat = -1e30;
+      double maxLon = -1e30;
+      for (final p in ring) {
+        final lat = p[0];
+        final lon = p[1];
+        if (lat < minLat) minLat = lat;
+        if (lon < minLon) minLon = lon;
+        if (lat > maxLat) maxLat = lat;
+        if (lon > maxLon) maxLon = lon;
+      }
+      if (minLat > maxLat || minLon > maxLon) return null;
+      return ll.LatLng((minLat + maxLat) / 2.0, (minLon + maxLon) / 2.0);
+    }
+
+    return null;
+  }
+
+  void _panToSelectedPaddock({required bool animate}) {
+    if (order.isEmpty) return;
+    final c = _centerForPaddockId(_p.id);
+    if (c == null) return;
+    _panTo(c, animate: animate);
+  }
+
+  void _panTo(ll.LatLng target, {required bool animate}) {
+    _mapPanTimer?.cancel();
+    if (!animate) {
+      _mapCenter = target;
+      _safeMapMove(target, _mapZoom);
+      return;
+    }
+
+    final start = _mapCenter ?? target;
+    const dur = Duration(milliseconds: 280);
+    const step = Duration(milliseconds: 16);
+    final steps = (dur.inMilliseconds / step.inMilliseconds).round().clamp(
+      1,
+      999,
+    );
+    int i = 0;
+    _mapPanTimer = Timer.periodic(step, (t) {
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
+      i++;
+      final tt = (i / steps).clamp(0.0, 1.0);
+      final ease = Curves.easeOutCubic.transform(tt);
+      final lat = start.latitude + (target.latitude - start.latitude) * ease;
+      final lon = start.longitude + (target.longitude - start.longitude) * ease;
+      final p = ll.LatLng(lat, lon);
+      _mapCenter = p;
+      _safeMapMove(p, _mapZoom);
+      if (tt >= 1.0) t.cancel();
+    });
+  }
+
+  void _safeMapMove(ll.LatLng center, double zoom) {
+    try {
+      _mapController.move(center, zoom);
+    } catch (_) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        try {
+          _mapController.move(center, zoom);
+        } catch (_) {
+          // If the map still isn't ready, ignore this move.
+        }
+      });
+    }
+  }
+
+  Future<void> _maybeStartGpsLiveTracking() async {
+    if (order.isEmpty) return;
+
+    _gpsTrackingActive = false;
+
+    final gpsEnabled = await storage.loadGpsMeasuringEnabled();
+    _gpsLiveEnabled = gpsEnabled;
+    if (!gpsEnabled) return;
+
+    final hasMap = await storage.hasFarmMap();
+    if (!hasMap) return;
+
+    if (mounted) setState(() {});
+
+    final svc = await Geolocator.isLocationServiceEnabled();
+    if (!svc) return;
+
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+    if (perm == LocationPermission.denied ||
+        perm == LocationPermission.deniedForever) {
+      return;
+    }
+
+    final polysRaw = await storage.loadFarmMapPolygons();
+    if (polysRaw.isEmpty) return;
+    _farmPolysRaw = polysRaw;
+
+    if (mounted) setState(() {});
+
+    _posSub?.cancel();
+    _gpsTrackingActive = false;
+    _posSub =
+        Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            distanceFilter: 1,
+          ),
+        ).listen((pos) async {
+          if (!mounted) return;
+          _lastPos = pos;
+
+          if (!_gpsTrackingActive) {
+            _gpsTrackingActive = true;
+            if (mounted) setState(() {});
+          }
+
+          final hit = await _paddockIdForPosition(
+            lat: pos.latitude,
+            lon: pos.longitude,
+            accuracyM: pos.accuracy,
+          );
+          await _maybeSwitchToHitPaddock(hit);
+
+          final center = ll.LatLng(pos.latitude, pos.longitude);
+          _mapCenter = center;
+          _safeMapMove(center, _mapZoom);
+          if (mounted) setState(() {});
+        }, onError: (_) {});
+  }
+
+  Future<String?> _paddockIdForPosition({
+    required double lat,
+    required double lon,
+    required double accuracyM,
+  }) async {
+    if (_farmPolysRaw.isEmpty) return null;
+    if (accuracyM.isFinite && accuracyM > 80) return null;
+
+    final allPaddocks = await storage.loadPaddocks();
+    final paddockById = {for (final p in allPaddocks) p.id: p};
+    final orderById = {for (final p in order) p.id: p};
+
+    for (final pr in _farmPolysRaw) {
+      final paddockId = pr['paddockId']?.toString();
+      if (paddockId == null || paddockId.isEmpty) continue;
+
+      final ringsAny = pr['polys'];
+      if (ringsAny is! List) continue;
+
+      for (final ringAny in ringsAny) {
+        final ring = _ringToLatLon(ringAny);
+        if (ring == null || ring.length < 3) continue;
+        if (_pointInRing(lat: lat, lon: lon, ring: ring)) {
+          final meta = paddockById[paddockId];
+          if (meta != null && !meta.includeInRotation) {
+            if (!_gpsExcludedWarned && mounted) {
+              _gpsExcludedWarned = true;
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('GPS: ${meta.name} is excluded')),
+              );
+            }
+            return null;
+          }
+
+          if (!orderById.containsKey(paddockId)) {
+            return null;
+          }
+          return paddockId;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  Future<void> _maybeSwitchToHitPaddock(String? hitId) async {
+    if (!mounted) return;
+    if (hitId == null) {
+      return;
+    }
+
+    if (hitId == _p.id) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final last = _gpsLastSwitchAt;
+    if (last != null &&
+        now.difference(last) < const Duration(milliseconds: 700)) {
+      return;
+    }
+
+    final newIdx = order.indexWhere((p) => p.id == hitId);
+    if (newIdx < 0 || newIdx == idx) return;
+
+    await _saveCurrent();
+    if (!mounted) return;
+    setState(() {
+      idx = newIdx;
+      currentCover = _coverForPaddock(_p.id);
+    });
+
+    if (!_gpsLiveEnabled) {
+      _panToSelectedPaddock(animate: true);
+    }
+
+    _gpsLastSwitchAt = now;
   }
 
   Future<void> _maybeGpsJumpToCurrentPaddock() async {
@@ -460,10 +732,6 @@ class _RoundScreenState extends State<RoundScreen>
     final t = ctrl.text.trim();
     if (t.isEmpty) return;
     await _appendNote(t);
-    if (!mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('Note added')));
   }
 
   // Centralised: decide what number should show when landing on a paddock
@@ -486,13 +754,13 @@ class _RoundScreenState extends State<RoundScreen>
     setState(() {
       currentCover = clamped;
 
-      // ✅ Always store draft as you type/adjust so it "sticks"
+      // Always store draft as you type/adjust so it "sticks"
       draftCover[_p.id] = clamped;
     });
   }
 
   Future<void> _saveCurrent() async {
-    // ✅ Save whatever is currently on screen (draft already updated)
+    // Save whatever is currently on screen (draft already updated)
     final m = Measurement(
       id: uuid.v4(),
       paddockId: _p.id,
@@ -519,8 +787,9 @@ class _RoundScreenState extends State<RoundScreen>
     if (idx < order.length - 1) {
       setState(() {
         idx++;
-        currentCover = _coverForPaddock(_p.id); // ✅ use draft/today/predicted
+        currentCover = _coverForPaddock(_p.id); // use draft/today/predicted
       });
+      _panToSelectedPaddock(animate: true);
     }
   }
 
@@ -529,8 +798,9 @@ class _RoundScreenState extends State<RoundScreen>
     if (idx > 0) {
       setState(() {
         idx--;
-        currentCover = _coverForPaddock(_p.id); // ✅ use draft/today/predicted
+        currentCover = _coverForPaddock(_p.id); // use draft/today/predicted
       });
+      _panToSelectedPaddock(animate: true);
     }
   }
 
@@ -565,327 +835,500 @@ class _RoundScreenState extends State<RoundScreen>
         actions: [TextButton(onPressed: _finish, child: const Text('Finish'))],
       ),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(14),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Row(
+        child: Stack(
+          children: [
+            if (_bgHasMap) Positioned.fill(child: _gpsBgMap()),
+            Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Expanded(
-                    child: SizedBox(
-                      height: 46,
-                      child: OutlinedButton(
-                        onPressed: () async {
-                          await _appendNote(noteBtn1);
-                          if (!context.mounted) return;
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text('Note added: $noteBtn1')),
-                          );
-                        },
-                        child: Text(
-                          noteBtn1,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                  Row(
+                    children: [
+                      Expanded(
+                        child: SizedBox(
+                          height: 46,
+                          child: OutlinedButton(
+                            style: _bgHasMap
+                                ? OutlinedButton.styleFrom(
+                                    backgroundColor: _overlayBoxColor,
+                                    foregroundColor: Colors.black,
+                                  )
+                                : null,
+                            onPressed: () async {
+                              await _appendNote(noteBtn1);
+                              if (!context.mounted) return;
+                            },
+                            child: Text(
+                              noteBtn1,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
                         ),
                       ),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: SizedBox(
-                      height: 46,
-                      child: OutlinedButton(
-                        onPressed: () async {
-                          await _appendNote(noteBtn2);
-                          if (!context.mounted) return;
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text('Note added: $noteBtn2')),
-                          );
-                        },
-                        child: Text(
-                          noteBtn2,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: SizedBox(
+                          height: 46,
+                          child: OutlinedButton(
+                            style: _bgHasMap
+                                ? OutlinedButton.styleFrom(
+                                    backgroundColor: _overlayBoxColor,
+                                    foregroundColor: Colors.black,
+                                  )
+                                : null,
+                            onPressed: () async {
+                              await _appendNote(noteBtn2);
+                            },
+                            child: Text(
+                              noteBtn2,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
                         ),
                       ),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: SizedBox(
-                      height: 46,
-                      child: OutlinedButton(
-                        onPressed: _appendCustomNote,
-                        child: const Text(
-                          'Custom',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: SizedBox(
+                          height: 46,
+                          child: OutlinedButton(
+                            style: _bgHasMap
+                                ? OutlinedButton.styleFrom(
+                                    backgroundColor: _overlayBoxColor,
+                                    foregroundColor: Colors.black,
+                                  )
+                                : null,
+                            onPressed: _appendCustomNote,
+                            child: const Text(
+                              'Custom',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
                         ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Expanded(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onLongPress: () async {
+                        _dismissHints();
+                        await _openNotesSheet();
+                      },
+                      onHorizontalDragStart: (_) {
+                        _hDragDx = 0.0;
+                        _hDragHandled = false;
+                      },
+                      onHorizontalDragUpdate: (details) async {
+                        if (_gpsTrackingActive) return;
+                        if (_hDragHandled) return;
+                        _hDragDx += details.delta.dx;
+
+                        const trigger = 60.0;
+                        if (_hDragDx <= -trigger) {
+                          _hDragHandled = true;
+                          _dismissHints();
+                          await _navNext();
+                        } else if (_hDragDx >= trigger) {
+                          _hDragHandled = true;
+                          _dismissHints();
+                          await _navPrev();
+                        }
+                      },
+                      onTapDown: (d) {
+                        final w = context.size?.width ?? 0;
+                        if (w <= 0) return;
+                        final isIncrease = d.localPosition.dx >= (w / 2);
+                        final delta = isIncrease ? coverStep : -coverStep;
+                        _adjust(delta);
+                        _fireTapFeedback(delta);
+                      },
+                      onHorizontalDragEnd: (details) async {
+                        if (_gpsTrackingActive) return;
+                        if (_hDragHandled) return;
+                        _dismissHints();
+                        final v = details.primaryVelocity ?? 0;
+                        if (v.abs() < 300) return;
+                        if (v < 0) {
+                          await _navNext();
+                        } else {
+                          await _navPrev();
+                        }
+                      },
+                      child: Stack(
+                        children: [
+                          AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 260),
+                            switchInCurve: Curves.easeOut,
+                            switchOutCurve: Curves.easeIn,
+                            transitionBuilder: (child, anim) {
+                              final begin = _lastTapWasIncrease
+                                  ? const Offset(0.15, 0)
+                                  : const Offset(-0.15, 0);
+                              final slide = Tween<Offset>(
+                                begin: begin,
+                                end: Offset.zero,
+                              ).animate(anim);
+                              return FadeTransition(
+                                opacity: anim,
+                                child: SlideTransition(
+                                  position: slide,
+                                  child: child,
+                                ),
+                              );
+                            },
+                            child: Column(
+                              key: ValueKey(_p.id),
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                InkWell(
+                                  onTap: () async {
+                                    _dismissHints();
+                                    await _jumpToPaddock();
+                                  },
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 2,
+                                    ),
+                                    child: Center(
+                                      child: Text(
+                                        'Paddock ${_p.name}  (${idx + 1}/${order.length})',
+                                        textAlign: TextAlign.center,
+                                        style: const TextStyle(
+                                          fontSize: 22,
+                                          fontWeight: FontWeight.w900,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: _InfoCard(
+                                        title: 'Last cover',
+                                        value: lastCoverText,
+                                        unit: 'kgDM/ha',
+                                        meta: lastDaysAgo,
+                                        solidBackground: _bgHasMap,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: _InfoCard(
+                                        title: 'Predicted',
+                                        value: _pred.toString(),
+                                        unit: 'kgDM/ha',
+                                        meta: growthLine,
+                                        solidBackground: _bgHasMap,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const Spacer(),
+                                Column(
+                                  children: [
+                                    Text(
+                                      currentCover.toString(),
+                                      style: const TextStyle(
+                                        fontSize: 78,
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                    ),
+                                    const Text(
+                                      'kgDM/ha',
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        color: Colors.black54,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const Spacer(),
+                              ],
+                            ),
+                          ),
+                          IgnorePointer(
+                            child: AnimatedBuilder(
+                              animation: _tapCtrl,
+                              builder: (context, _) {
+                                if (_tapCtrl.value <= 0) {
+                                  return const SizedBox.shrink();
+                                }
+
+                                final isInc = _lastTapDelta > 0;
+                                final color = isInc ? Colors.green : Colors.red;
+                                final sideAlign = isInc
+                                    ? Alignment.centerRight
+                                    : Alignment.centerLeft;
+
+                                final overlay = Align(
+                                  alignment: sideAlign,
+                                  child: FractionallySizedBox(
+                                    widthFactor: 0.5,
+                                    heightFactor: 1.0,
+                                    child: Opacity(
+                                      opacity: 0.25 * (1 - _tapOpacity.value),
+                                      child: Container(color: color),
+                                    ),
+                                  ),
+                                );
+
+                                final sign = isInc ? '+' : '−';
+                                final txt = '$sign${_lastTapDelta.abs()}';
+                                final dx =
+                                    (isInc ? 1 : -1) *
+                                    (1 - _deltaT.value) *
+                                    140;
+                                final dy = (1 - _deltaT.value) * 40;
+                                final floaty = Align(
+                                  alignment: Alignment.center,
+                                  child: Transform.translate(
+                                    offset: Offset(dx, dy),
+                                    child: Opacity(
+                                      opacity: 1 - _tapOpacity.value,
+                                      child: Text(
+                                        txt,
+                                        style: TextStyle(
+                                          fontSize: 26,
+                                          fontWeight: FontWeight.w900,
+                                          color: color,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                );
+
+                                return Stack(children: [overlay, floaty]);
+                              },
+                            ),
+                          ),
+                          if (_showHints && idx == 0)
+                            Positioned.fill(
+                              child: IgnorePointer(
+                                child: AnimatedOpacity(
+                                  opacity: 1,
+                                  duration: const Duration(milliseconds: 250),
+                                  child: Container(
+                                    color: Colors.black.withValues(alpha: 0.08),
+                                    padding: const EdgeInsets.all(14),
+                                    child: Stack(
+                                      children: [
+                                        Align(
+                                          alignment: Alignment.bottomCenter,
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 12,
+                                              vertical: 10,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: Colors.white,
+                                              borderRadius:
+                                                  BorderRadius.circular(14),
+                                              boxShadow: [
+                                                BoxShadow(
+                                                  blurRadius: 18,
+                                                  color: Colors.black
+                                                      .withValues(alpha: 0.12),
+                                                ),
+                                              ],
+                                            ),
+                                            child: const Text(
+                                              'Tap left/right to -/+ cover\nSwipe to change paddock\nLong-press for notes\nTap header to jump',
+                                              textAlign: TextAlign.center,
+                                              style: TextStyle(
+                                                fontSize: 13,
+                                                fontWeight: FontWeight.w800,
+                                                color: Colors.black87,
+                                                height: 1.25,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        Align(
+                                          alignment: Alignment.centerLeft,
+                                          child: Padding(
+                                            padding: const EdgeInsets.only(
+                                              left: 6.0,
+                                            ),
+                                            child: Text(
+                                              '-$coverStep',
+                                              style: const TextStyle(
+                                                fontSize: 16,
+                                                fontWeight: FontWeight.w900,
+                                                color: Colors.red,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        Align(
+                                          alignment: Alignment.centerRight,
+                                          child: Padding(
+                                            padding: const EdgeInsets.only(
+                                              right: 6.0,
+                                            ),
+                                            child: Text(
+                                              '+$coverStep',
+                                              style: const TextStyle(
+                                                fontSize: 16,
+                                                fontWeight: FontWeight.w900,
+                                                color: Colors.green,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
                       ),
                     ),
                   ),
                 ],
               ),
-              const SizedBox(height: 10),
-              Expanded(
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onLongPress: () async {
-                    _dismissHints();
-                    await _openNotesSheet();
-                  },
-                  onTapDown: (d) {
-                    final w = context.size?.width ?? 0;
-                    if (w <= 0) return;
-                    final isIncrease = d.localPosition.dx >= (w / 2);
-                    final delta = isIncrease ? coverStep : -coverStep;
-                    _adjust(delta);
-                    _fireTapFeedback(delta);
-                  },
-                  onHorizontalDragEnd: (details) async {
-                    _dismissHints();
-                    final v = details.primaryVelocity ?? 0;
-                    if (v.abs() < 300) return;
-                    if (v < 0) {
-                      await _navNext();
-                    } else {
-                      await _navPrev();
-                    }
-                  },
-                  child: Stack(
-                    children: [
-                      AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 260),
-                        switchInCurve: Curves.easeOut,
-                        switchOutCurve: Curves.easeIn,
-                        transitionBuilder: (child, anim) {
-                          final begin = _lastTapWasIncrease
-                              ? const Offset(0.15, 0)
-                              : const Offset(-0.15, 0);
-                          final slide = Tween<Offset>(
-                            begin: begin,
-                            end: Offset.zero,
-                          ).animate(anim);
-                          return FadeTransition(
-                            opacity: anim,
-                            child: SlideTransition(
-                              position: slide,
-                              child: child,
-                            ),
-                          );
-                        },
-                        child: Column(
-                          key: ValueKey(_p.id),
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            InkWell(
-                              onTap: () async {
-                                _dismissHints();
-                                await _jumpToPaddock();
-                              },
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  vertical: 2,
-                                ),
-                                child: Text(
-                                  'Paddock ${_p.name}  (${idx + 1}/${order.length})',
-                                  style: const TextStyle(
-                                    fontSize: 22,
-                                    fontWeight: FontWeight.w900,
-                                  ),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 10),
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: _InfoCard(
-                                    title: 'Last cover',
-                                    value: lastCoverText,
-                                    unit: 'kgDM/ha',
-                                    meta: lastDaysAgo,
-                                  ),
-                                ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: _InfoCard(
-                                    title: 'Predicted',
-                                    value: _pred.toString(),
-                                    unit: 'kgDM/ha',
-                                    meta: growthLine,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const Spacer(),
-                            Column(
-                              children: [
-                                Text(
-                                  currentCover.toString(),
-                                  style: const TextStyle(
-                                    fontSize: 78,
-                                    fontWeight: FontWeight.w900,
-                                  ),
-                                ),
-                                const Text(
-                                  'kgDM/ha',
-                                  style: TextStyle(
-                                    fontSize: 14,
-                                    color: Colors.black54,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const Spacer(),
-                          ],
-                        ),
-                      ),
-                      IgnorePointer(
-                        child: AnimatedBuilder(
-                          animation: _tapCtrl,
-                          builder: (context, _) {
-                            if (_tapCtrl.value <= 0) {
-                              return const SizedBox.shrink();
-                            }
-
-                            final isInc = _lastTapDelta > 0;
-                            final color = isInc ? Colors.green : Colors.red;
-                            final sideAlign = isInc
-                                ? Alignment.centerRight
-                                : Alignment.centerLeft;
-
-                            final overlay = Align(
-                              alignment: sideAlign,
-                              child: FractionallySizedBox(
-                                widthFactor: 0.5,
-                                heightFactor: 1.0,
-                                child: Opacity(
-                                  opacity: 0.25 * (1 - _tapOpacity.value),
-                                  child: Container(color: color),
-                                ),
-                              ),
-                            );
-
-                            final sign = isInc ? '+' : '−';
-                            final txt = '$sign${_lastTapDelta.abs()}';
-                            final dx =
-                                (isInc ? 1 : -1) * (1 - _deltaT.value) * 140;
-                            final dy = (1 - _deltaT.value) * 40;
-                            final floaty = Align(
-                              alignment: Alignment.center,
-                              child: Transform.translate(
-                                offset: Offset(dx, dy),
-                                child: Opacity(
-                                  opacity: 1 - _tapOpacity.value,
-                                  child: Text(
-                                    txt,
-                                    style: TextStyle(
-                                      fontSize: 26,
-                                      fontWeight: FontWeight.w900,
-                                      color: color,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            );
-
-                            return Stack(children: [overlay, floaty]);
-                          },
-                        ),
-                      ),
-                      if (_showHints && idx == 0)
-                        Positioned.fill(
-                          child: IgnorePointer(
-                            child: AnimatedOpacity(
-                              opacity: 1,
-                              duration: const Duration(milliseconds: 250),
-                              child: Container(
-                                color: Colors.black.withValues(alpha: 0.08),
-                                padding: const EdgeInsets.all(14),
-                                child: Stack(
-                                  children: [
-                                    Align(
-                                      alignment: Alignment.bottomCenter,
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 12,
-                                          vertical: 10,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: Colors.white,
-                                          borderRadius: BorderRadius.circular(
-                                            14,
-                                          ),
-                                          boxShadow: [
-                                            BoxShadow(
-                                              blurRadius: 18,
-                                              color: Colors.black.withValues(
-                                                alpha: 0.12,
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                        child: const Text(
-                                          'Tap left/right to -/+ cover\nSwipe to change paddock\nLong-press for notes\nTap header to jump',
-                                          textAlign: TextAlign.center,
-                                          style: TextStyle(
-                                            fontSize: 13,
-                                            fontWeight: FontWeight.w800,
-                                            color: Colors.black87,
-                                            height: 1.25,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                    Align(
-                                      alignment: Alignment.centerLeft,
-                                      child: Padding(
-                                        padding: const EdgeInsets.only(
-                                          left: 6.0,
-                                        ),
-                                        child: Text(
-                                          '-$coverStep',
-                                          style: const TextStyle(
-                                            fontSize: 16,
-                                            fontWeight: FontWeight.w900,
-                                            color: Colors.red,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                    Align(
-                                      alignment: Alignment.centerRight,
-                                      child: Padding(
-                                        padding: const EdgeInsets.only(
-                                          right: 6.0,
-                                        ),
-                                        child: Text(
-                                          '+$coverStep',
-                                          style: const TextStyle(
-                                            fontSize: 16,
-                                            fontWeight: FontWeight.w900,
-                                            color: Colors.green,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
+  }
+
+  Widget _gpsBgMap() {
+    final pos = _lastPos;
+    final gpsCenter = pos == null
+        ? null
+        : ll.LatLng(pos.latitude, pos.longitude);
+
+    final center = (_gpsLiveEnabled && gpsCenter != null)
+        ? gpsCenter
+        : (_mapCenter ?? const ll.LatLng(0, 0));
+
+    return IgnorePointer(
+      child: Opacity(
+        opacity: 0.42,
+        child: FlutterMap(
+          mapController: _mapController,
+          options: MapOptions(
+            initialCenter: center,
+            initialZoom: _mapZoom,
+            interactionOptions: const InteractionOptions(
+              flags: InteractiveFlag.none,
+            ),
+            onMapEvent: (e) {
+              final z = e.camera.zoom;
+              if (z != _mapZoom && mounted) {
+                setState(() => _mapZoom = z);
+              }
+            },
+          ),
+          children: [
+            TileLayer(
+              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+              userAgentPackageName: 'pasture_walk',
+              tileBuilder: (context, widget, tile) {
+                return Opacity(
+                  opacity: 0.65,
+                  child: ColorFiltered(
+                    colorFilter: const ColorFilter.matrix(<double>[
+                      0.2126,
+                      0.7152,
+                      0.0722,
+                      0,
+                      0,
+                      0.2126,
+                      0.7152,
+                      0.0722,
+                      0,
+                      0,
+                      0.2126,
+                      0.7152,
+                      0.0722,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      1,
+                      0,
+                    ]),
+                    child: widget,
+                  ),
+                );
+              },
+            ),
+            PolygonLayer(polygons: _bgMapPolygons()),
+            if (_gpsLiveEnabled && pos != null)
+              CircleLayer(
+                circles: [
+                  CircleMarker(
+                    point: ll.LatLng(pos.latitude, pos.longitude),
+                    radius: 7,
+                    color: Colors.blue.withValues(alpha: 0.9),
+                    borderStrokeWidth: 2,
+                    borderColor: Colors.white,
+                  ),
+                  if (pos.accuracy.isFinite)
+                    CircleMarker(
+                      point: ll.LatLng(pos.latitude, pos.longitude),
+                      radius: (pos.accuracy).clamp(8, 80).toDouble(),
+                      useRadiusInMeter: true,
+                      color: Colors.blue.withValues(alpha: 0.12),
+                      borderStrokeWidth: 1,
+                      borderColor: Colors.blue.withValues(alpha: 0.22),
+                    ),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Polygon> _bgMapPolygons() {
+    if (_farmPolysRaw.isEmpty) return const [];
+
+    final now = DateTime.now();
+    final out = <Polygon>[];
+    for (final pr in _farmPolysRaw) {
+      final paddockId = pr['paddockId']?.toString();
+      if (paddockId == null || paddockId.isEmpty) continue;
+
+      final lm = lastMeasured[paddockId];
+      final measuredToday = lm != null && _sameDay(lm.at, now);
+      final isCurrent = paddockId == _p.id;
+
+      final ringsAny = pr['polys'];
+      if (ringsAny is! List) continue;
+
+      for (final ringAny in ringsAny) {
+        final ring = _ringToLatLon(ringAny);
+        if (ring == null || ring.length < 3) continue;
+        final pts = ring.map((e) => ll.LatLng(e[0], e[1])).toList();
+        out.add(
+          Polygon(
+            points: pts,
+            borderColor: measuredToday
+                ? Colors.green.withValues(alpha: 0.95)
+                : Colors.black.withValues(alpha: 0.45),
+            borderStrokeWidth: measuredToday ? 3.0 : 1.4,
+            color: isCurrent
+                ? Colors.green.withValues(alpha: 0.26)
+                : Colors.transparent,
+            isFilled: true,
+          ),
+        );
+        break;
+      }
+    }
+    return out;
   }
 }
 
@@ -894,19 +1337,30 @@ class _InfoCard extends StatelessWidget {
   final String value;
   final String unit;
   final String meta;
+  final bool solidBackground;
 
   const _InfoCard({
     required this.title,
     required this.value,
     required this.unit,
     required this.meta,
+    this.solidBackground = false,
   });
 
   @override
   Widget build(BuildContext context) {
+    final bg = solidBackground
+        ? Colors.grey.shade300.withValues(alpha: 0.80)
+        : Colors.black.withValues(alpha: 0.04);
+    final titleC = solidBackground
+        ? Colors.black.withValues(alpha: 0.72)
+        : Colors.black54;
+    final metaC = solidBackground
+        ? Colors.black.withValues(alpha: 0.62)
+        : Colors.black45;
     return Card(
       elevation: 0,
-      color: Colors.black.withValues(alpha: 0.04),
+      color: bg,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         child: Column(
@@ -914,9 +1368,9 @@ class _InfoCard extends StatelessWidget {
           children: [
             Text(
               title,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 12,
-                color: Colors.black54,
+                color: titleC,
                 fontWeight: FontWeight.w700,
               ),
             ),
@@ -936,9 +1390,9 @@ class _InfoCard extends StatelessWidget {
                   padding: const EdgeInsets.only(bottom: 2),
                   child: Text(
                     unit,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 11,
-                      color: Colors.black54,
+                      color: titleC,
                       fontWeight: FontWeight.w700,
                     ),
                   ),
@@ -948,9 +1402,9 @@ class _InfoCard extends StatelessWidget {
             const SizedBox(height: 6),
             Text(
               meta,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 11,
-                color: Colors.black45,
+                color: metaC,
                 fontWeight: FontWeight.w600,
               ),
               maxLines: 2,

@@ -53,7 +53,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       noteBtn1 = b1;
       noteBtn2 = b2;
       gpsMeasuring = gps;
-      _versionText = 'v${info.version}';
+      final bn = info.buildNumber.trim();
+      _versionText = bn.isEmpty ? 'v${info.version}' : 'v${info.version}+$bn';
     });
 
     await _checkForUpdate(currentVersion: info.version);
@@ -361,9 +362,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           SwitchListTile(
             secondary: const Icon(Icons.my_location),
-            title: const Text('GPS measuring'),
-            subtitle: const Text(
-              'Auto-select the paddock you are in when recording covers (requires a farm map).',
+            title: const Text('Cover measuring mode'),
+            subtitle: Text(
+              gpsMeasuring
+                  ? 'GPS mode: auto-select the paddock you are in when recording covers (requires a farm map).'
+                  : 'Manual mode: swipe or tap the paddock header to select the paddock you are measuring.',
             ),
             value: gpsMeasuring,
             onChanged: (v) async {
