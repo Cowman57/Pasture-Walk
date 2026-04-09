@@ -293,6 +293,44 @@ class Storage {
   /// Helper: raw load all notes
   Future<List<NoteEntry>> loadAllNotes() async => _loadNotes();
 
+  /// Same result as [lastMeasurementForPaddock] but scans [all] in memory (batch use).
+  static Measurement? latestMeasurementFromList(
+    List<Measurement> all,
+    String paddockId,
+  ) {
+    Measurement? best;
+    for (final m in all) {
+      if (m.paddockId != paddockId) continue;
+      if (best == null || m.at.isAfter(best.at)) best = m;
+    }
+    return best;
+  }
+
+  /// Same rules as [latestAnchorForPaddockAsOf] using pre-loaded lists (batch use).
+  static Anchor? latestAnchorFromLists(
+    List<Measurement> allMeasurements,
+    List<Grazing> allGrazings,
+    String paddockId,
+    DateTime asOf,
+  ) {
+    Measurement? m0;
+    for (final m in allMeasurements) {
+      if (m.paddockId != paddockId || m.at.isAfter(asOf)) continue;
+      if (m0 == null || m.at.isAfter(m0.at)) m0 = m;
+    }
+    Grazing? g0;
+    for (final g in allGrazings) {
+      if (g.paddockId != paddockId || g.at.isAfter(asOf)) continue;
+      if (g0 == null || g.at.isAfter(g0.at)) g0 = g;
+    }
+    if (m0 == null && g0 == null) return null;
+    if (m0 != null && g0 == null) return Anchor(m0.at, m0.cover);
+    if (g0 != null && m0 == null) return Anchor(g0.at, g0.residual);
+    return m0!.at.isAfter(g0!.at)
+        ? Anchor(m0.at, m0.cover)
+        : Anchor(g0.at, g0.residual);
+  }
+
   Future<List<Measurement>> measurementsForPaddock(String paddockId) async {
     final all = await _loadMeasurements();
     return all.where((m) => m.paddockId == paddockId).toList()
@@ -300,8 +338,8 @@ class Storage {
   }
 
   Future<Measurement?> lastMeasurementForPaddock(String paddockId) async {
-    final list = await measurementsForPaddock(paddockId);
-    return list.isEmpty ? null : list.first;
+    final all = await _loadMeasurements();
+    return latestMeasurementFromList(all, paddockId);
   }
 
   /// Implicit anchor = last measurement OR last grazing residual
@@ -313,20 +351,9 @@ class Storage {
     String paddockId,
     DateTime asOf,
   ) async {
-    final allM = await measurementsForPaddock(paddockId);
-    final m = allM.where((x) => !x.at.isAfter(asOf)).toList()
-      ..sort((a, b) => b.at.compareTo(a.at));
-    final m0 = m.isEmpty ? null : m.first;
-
-    final g0 = await _lastGrazingForPaddockAsOf(paddockId, asOf);
-
-    if (m0 == null && g0 == null) return null;
-    if (m0 != null && g0 == null) return Anchor(m0.at, m0.cover);
-    if (g0 != null && m0 == null) return Anchor(g0.at, g0.residual);
-
-    return m0!.at.isAfter(g0!.at)
-        ? Anchor(m0.at, m0.cover)
-        : Anchor(g0.at, g0.residual);
+    final allM = await _loadMeasurements();
+    final allG = await _loadGrazings();
+    return latestAnchorFromLists(allM, allG, paddockId, asOf);
   }
 
   /// Overwrites measurement for today if present
@@ -479,14 +506,23 @@ class Storage {
   // -----------------------------
   Future<double> computeFarmGrowthKgDmPerHaPerDay() async {
     final msAll = await _loadMeasurements();
+    final gsAll = await _loadGrazings();
+    final includedIds = await _includedPaddockIds();
+    return computeFarmGrowthFromLoadedData(msAll, gsAll, includedIds);
+  }
+
+  /// Same rules as [computeFarmGrowthKgDmPerHaPerDay] but uses already-decoded lists
+  /// so callers can avoid duplicate SharedPreferences + JSON work.
+  double computeFarmGrowthFromLoadedData(
+    List<Measurement> msAll,
+    List<Grazing> gsAll,
+    Set<String> includedIds,
+  ) {
     if (msAll.length < 2) return 0;
 
-    // Only included paddocks
-    final includedIds = await _includedPaddockIds();
     final ms = msAll.where((m) => includedIds.contains(m.paddockId)).toList();
     if (ms.length < 2) return 0;
 
-    // Group measurements by paddock
     final byPdk = <String, List<Measurement>>{};
     for (final m in ms) {
       (byPdk[m.paddockId] ??= []).add(m);
@@ -494,14 +530,11 @@ class Storage {
 
     final rates = <double>[];
 
-    // For each paddock: find the most recent valid measurement-to-measurement segment
-    // where NO grazing occurred between the two measurements.
     for (final entry in byPdk.entries) {
       final paddockId = entry.key;
       final list = entry.value..sort((a, b) => a.at.compareTo(b.at));
       if (list.length < 2) continue;
 
-      // Start from the latest measurement and walk backwards until we find a valid "prev"
       final cur = list.last;
 
       for (int i = list.length - 2; i >= 0; i--) {
@@ -510,8 +543,8 @@ class Storage {
         final daysDiff = cur.at.difference(prev.at).inDays;
         if (daysDiff <= 0) continue;
 
-        // Skip segments that include a grazing event (resets cover)
-        final grazedBetween = await paddockGrazedBetween(
+        final grazedBetween = Storage.paddockGrazedBetweenFromList(
+          gsAll,
           paddockId,
           prev.at,
           cur.at,
@@ -520,21 +553,28 @@ class Storage {
 
         final rate = (cur.cover - prev.cover) / daysDiff;
 
-        // Ignore paddocks that have decreased in cover (often grazed / not representative).
         if (rate <= 0) continue;
 
         rates.add(rate);
-        break; // only use most recent valid segment for this paddock
+        break;
       }
     }
 
     if (rates.isEmpty) return 0;
 
     final avg = rates.reduce((a, b) => a + b) / rates.length;
-
-    // If you never want negative farm growth in prediction, clamp it here:
-    // return avg < 0 ? 0 : avg;
     return avg;
+  }
+
+  static bool paddockGrazedBetweenFromList(
+    List<Grazing> allG,
+    String paddockId,
+    DateTime a,
+    DateTime b,
+  ) {
+    return allG.any(
+      (x) => x.paddockId == paddockId && x.at.isAfter(a) && x.at.isBefore(b),
+    );
   }
 
   // -----------------------------
@@ -783,9 +823,7 @@ class Storage {
     DateTime b,
   ) async {
     final g = await _loadGrazings();
-    return g.any(
-      (x) => x.paddockId == paddockId && x.at.isAfter(a) && x.at.isBefore(b),
-    );
+    return paddockGrazedBetweenFromList(g, paddockId, a, b);
   }
 }
 

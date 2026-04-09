@@ -264,18 +264,41 @@ class _RoundScreenState extends State<RoundScreen>
     order = order.where((p) => p.includeInRotation).toList();
     order.sort((a, b) => a.recordOrder.compareTo(b.recordOrder));
 
-    noteBtn1 = await storage.loadNoteButton1Title();
-    noteBtn2 = await storage.loadNoteButton2Title();
+    final manualGrowth = await storage.loadManualFarmGrowthKgDmPerHaPerDay();
+    final batch = await Future.wait<Object>([
+      storage.loadAllMeasurements(),
+      storage.loadAllGrazings(),
+      storage.loadNoteButton1Title(),
+      storage.loadNoteButton2Title(),
+      storage.loadCoverStep(),
+    ]);
 
-    farmGrowth = await storage.effectiveFarmGrowthKgDmPerHaPerDay();
+    final allMeasurements = batch[0] as List<Measurement>;
+    final allGrazings = batch[1] as List<Grazing>;
+    noteBtn1 = batch[2] as String;
+    noteBtn2 = batch[3] as String;
+    coverStep = batch[4] as int;
+
+    final includedIds = order.map((p) => p.id).toSet();
+    farmGrowth = manualGrowth ??
+        storage.computeFarmGrowthFromLoadedData(
+          allMeasurements,
+          allGrazings,
+          includedIds,
+        );
 
     final now = DateTime.now();
 
     for (final p in order) {
-      final lm = await storage.lastMeasurementForPaddock(p.id);
+      final lm = Storage.latestMeasurementFromList(allMeasurements, p.id);
       lastMeasured[p.id] = lm;
 
-      final anchor = await storage.latestAnchorForPaddock(p.id);
+      final anchor = Storage.latestAnchorFromLists(
+        allMeasurements,
+        allGrazings,
+        p.id,
+        now,
+      );
       final base = anchor?.coverKgDmHa ?? 2500;
       final days = anchor == null ? 0 : now.difference(anchor.at).inDays;
 
@@ -290,7 +313,6 @@ class _RoundScreenState extends State<RoundScreen>
     if (order.isNotEmpty) {
       currentCover = _coverForPaddock(order[idx].id);
     }
-    coverStep = await storage.loadCoverStep();
 
     await _maybeLoadFarmMapForBackground();
 
@@ -821,6 +843,69 @@ class _RoundScreenState extends State<RoundScreen>
   Widget build(BuildContext context) {
     if (!loaded) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    if (order.isEmpty) {
+      final warnColor = Colors.orange.shade50;
+      final borderColor = Colors.orange.shade200;
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Record covers'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+        body: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 400),
+                child: Card(
+                  elevation: 0,
+                  color: warnColor,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    side: BorderSide(color: borderColor, width: 1.5),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 20, 20, 22),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.warning_amber_rounded,
+                          size: 48,
+                          color: Colors.orange.shade800,
+                        ),
+                        const SizedBox(height: 14),
+                        Text(
+                          'Add paddocks first',
+                          style: Theme.of(context).textTheme.titleLarge
+                              ?.copyWith(fontWeight: FontWeight.w700),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          'There are no paddocks in your rotation. In Settings, '
+                          'use Add / edit paddocks and Recording order, and turn '
+                          'on “Include in rotation” for each paddock you want. You '
+                          'can also import paddocks or a map from Settings.',
+                          style: Theme.of(context).textTheme.bodyMedium,
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
     }
 
     final now = DateTime.now();

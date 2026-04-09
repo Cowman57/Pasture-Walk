@@ -1,0 +1,419 @@
+Pasture Walk — App Store release guide (expanded)
+================================================
+
+This guide is for releasing the iOS version of Pasture Walk on Apple’s App Store.
+You do not need to edit Dart code for a basic release, but you will use Apple’s
+websites, the Xcode app on a Mac, and optionally a few text files in this project.
+
+
+Before you start — what you need
+--------------------------------
+• A Mac computer (Apple does not let you build iOS App Store apps from Windows
+  or Linux for the final signed upload; you need macOS + Xcode).
+
+• An Apple ID (the email/password you use for iCloud or the App Store).
+
+• Paid membership in the Apple Developer Program (about one yearly fee). Free
+  accounts cannot submit apps to the public App Store.
+
+• This project folder on your Mac (the pasture_walk folder that contains
+  pubspec.yaml and an ios folder).
+
+• Optional but helpful: a physical iPhone to install a test build before you
+  submit to review.
+
+
+Quick glossary (terms Apple uses)
+---------------------------------
+• Bundle ID — A unique reverse-domain-style name for your app, like
+  com.yourname.pasturewalk. It must match everywhere: Xcode, App Store Connect,
+  and any certificates. It cannot be changed for an app after it is on the store
+  for the first time (you would publish a new app instead).
+
+• Version — What users see as the app version (e.g. 2.1.0). Often called
+  “marketing version.”
+
+• Build number — An integer that must go up every time you upload a new binary
+  to App Store Connect (1, 2, 3, …), even if the user-visible version stays the
+  same.
+
+• IPA — The packaged iOS app file you upload to Apple (created by Flutter or
+  Xcode).
+
+• Archive — Xcode’s way of packaging your app for distribution.
+
+• App Store Connect — Apple’s website where you create the app listing,
+  screenshots, privacy answers, and submit for review:
+  https://appstoreconnect.apple.com
+
+
+Where “Pasture Walk” stores iOS settings in this project
+-------------------------------------------------------
+These are the files people usually touch for a first release. You do not have to
+open all of them by hand if you use Xcode for signing and version (recommended).
+
+  pubspec.yaml
+    At the top, the line `version: 2.1.0+1` means:
+      2.1.0 = version string shown to users (when Flutter builds iOS).
+      1     = build number (after the +).
+    Flutter’s `flutter build ipa` uses these unless you override with flags.
+    Keeping this in sync with Xcode avoids confusion.
+
+  ios/Runner.xcodeproj/project.pbxproj
+    Xcode’s project file. It contains PRODUCT_BUNDLE_IDENTIFIER (bundle IDs for
+    the main app and tests). Changing the bundle ID in Xcode updates this file
+    automatically. Advanced users sometimes edit it in a text editor — not
+    recommended for beginners.
+
+  ios/Runner/Info.plist
+    iOS configuration: permissions text (why the app uses location, etc.),
+    and placeholders that Xcode fills in for bundle ID and versions. If Apple
+    asks you to fix a permission description, it is often this file.
+
+  ios/Runner/Assets.xcassets/AppIcon.appiconset/
+    App icon images. Xcode or asset tools expect the right sizes in this folder.
+
+  ios/Runner/Base.lproj/LaunchScreen.storyboard (and related assets)
+    The screen shown while the app launches.
+
+  ios/Runner.xcworkspace
+    Always open THIS in Xcode (not Runner.xcodeproj alone), because Flutter uses
+    CocoaPods; the workspace includes both the app and dependencies.
+
+
+Current placeholder bundle ID in this repo
+------------------------------------------
+The project may still use com.example.pastureWalk. Apple does not allow
+com.example.* for real App Store apps. You must pick your own bundle ID under
+your Apple Developer team (for example com.yourfamilyname.pasturewalk) and use
+it consistently in Xcode and App Store Connect.
+
+
+================================================================================
+STEP 0 — Install tools on your Mac
+================================================================================
+
+1. Install Xcode from the Mac App Store (full install, several gigabytes).
+
+2. Open Xcode once and accept license / install extra components if prompted.
+
+3. Install Flutter (https://docs.flutter.dev/get-started/install/macos) and run
+   `flutter doctor` in Terminal. Fix anything it marks as required for iOS
+   (Xcode command line tools, CocoaPods, etc.).
+
+4. In Terminal, `cd` into the pasture_walk folder and run:
+     flutter pub get
+   This downloads dependencies. You only need to repeat when dependencies change.
+
+
+================================================================================
+STEP 1 — Join Apple’s Developer Program
+================================================================================
+
+Goal: A paid account that can sign apps and use App Store Connect.
+
+1. Go to https://developer.apple.com/programs/
+
+2. Enrol with the Apple ID you will use for publishing (same ID everywhere).
+
+3. Complete payment and verification. It can take a day or two for approval.
+
+4. After enrolment, sign in at https://developer.apple.com and
+   https://appstoreconnect.apple.com with the same Apple ID.
+
+
+Files: None in this project.
+
+
+================================================================================
+STEP 2 — Create the app record in App Store Connect
+================================================================================
+
+Goal: A placeholder for your app in Apple’s system (name, bundle ID slot).
+
+1. Open https://appstoreconnect.apple.com and sign in.
+
+2. My Apps → click the “+” button → New App.
+
+3. Fill in:
+   • Platform: iOS (add others only if you ship those later).
+   • Name: the name shown on the store (e.g. Pasture Walk).
+   • Primary language.
+   • Bundle ID: If you have not registered one yet, you may need to create it in
+     the Apple Developer portal (Certificates, Identifiers & Profiles →
+     Identifiers → App IDs) first, then pick it here. It must match Xcode exactly.
+   • SKU: any internal reference you like (e.g. pasture-walk-001); users do not
+     see it.
+
+4. Save. You can return later to add screenshots and description.
+
+Files: No project files yet; this is all on Apple’s website. The bundle ID you
+choose must be the one you will set in Xcode (Step 4).
+
+
+================================================================================
+STEP 3 — Register bundle ID (if App Store Connect asks for it)
+================================================================================
+
+If you cannot select your bundle ID in App Store Connect:
+
+1. Go to https://developer.apple.com/account → Certificates, Identifiers &
+   Profiles → Identifiers → + → App IDs → App.
+
+2. Enter description and Explicit bundle ID (e.g. com.yourname.pasturewalk).
+
+3. Enable capabilities your app needs (e.g. if you use push notifications or
+   certain maps features — for a simple app, defaults are often enough; you can
+   add capabilities later if Apple or Xcode asks).
+
+4. Register, then return to App Store Connect and create the app again if needed.
+
+
+Files: Still Apple’s website. The string you register is what you type in Xcode.
+
+
+================================================================================
+STEP 4 — Bundle ID and signing in Xcode (main project file changes)
+================================================================================
+
+Goal: The app builds with YOUR team and YOUR bundle ID so Apple accepts uploads.
+
+1. In Finder, open:
+     pasture_walk/ios/Runner.xcworkspace
+   Double-click it to open in Xcode (always use .xcworkspace).
+
+2. In the left sidebar, click the blue “Runner” project at the top.
+
+3. Under TARGETS, select “Runner” (not RunnerTests first).
+
+4. Open the “Signing & Capabilities” tab.
+
+5. Check “Automatically manage signing”.
+
+6. Team: choose your Apple Developer team (your name or company).
+
+7. Bundle Identifier: change from com.example.pastureWalk to the EXACT bundle ID
+   you created in App Store Connect / Developer portal (e.g. com.yourname.pasturewalk).
+
+8. Xcode may show errors until you pick a valid team; fixing them usually means
+   selecting the right team or fixing the bundle ID to match App Store Connect.
+
+9. Select the “RunnerTests” target under TARGETS. Set its bundle identifier to
+   something unique (often the main app ID with .RunnerTests on the end). Xcode
+   may suggest this automatically.
+
+What changed on disk: Xcode updates ios/Runner.xcodeproj/project.pbxproj with
+your PRODUCT_BUNDLE_IDENTIFIER lines. You should not need to edit that file by
+hand if Xcode did this.
+
+
+================================================================================
+STEP 5 — Version and build numbers
+================================================================================
+
+Goal: Each upload has a new build number; the version string matches what you
+want users to see.
+
+Easy path (recommended for beginners):
+
+1. In Xcode, with the Runner target selected, open the “General” tab.
+
+2. Version: e.g. 2.1.0 (user-visible).
+
+3. Build: integer, increase every time you upload (1, 2, 3, …).
+
+Flutter alignment:
+
+1. Open pubspec.yaml in a text editor.
+
+2. Set the version line to match your intent, for example:
+     version: 2.1.0+3
+   meaning version 2.1.0 and build 3. Flutter’s `flutter build ipa` uses this
+   unless you pass --build-name and --build-number.
+
+Files:
+  • pubspec.yaml — version line at the top.
+  • Xcode General tab — mirrors version/build for the iOS target (Flutter often
+    syncs from pubspec when you build from the command line; check both if you
+    are unsure).
+
+
+================================================================================
+STEP 6 — Icons and launch screen
+================================================================================
+
+Goal: Icons look sharp on all devices; launch screen does not look broken.
+
+1. App icons live in:
+     ios/Runner/Assets.xcassets/AppIcon.appiconset/
+   You can replace images there using Xcode: open Assets.xcassets → AppIcon and
+   drag images into each slot, or use a generator tool that outputs the full set.
+
+2. Launch screen:
+     ios/Runner/Base.lproj/LaunchScreen.storyboard
+   and any images referenced from Assets.xcassets. Open the storyboard in Xcode
+   to preview.
+
+3. Test on a real device if possible (Step 10).
+
+
+================================================================================
+STEP 7 — Privacy permission strings (Info.plist)
+================================================================================
+
+Goal: If the app uses location, camera, photos, etc., Apple requires clear
+English sentences explaining why. Reviewers read these.
+
+1. Open ios/Runner/Info.plist in Xcode or a text editor.
+
+2. Look for keys like NSLocationWhenInUseUsageDescription. The text must be
+   true for what your app does (e.g. why pasture mapping needs location).
+
+3. If you add new permissions in code later, add matching keys here.
+
+Files:
+  • ios/Runner/Info.plist
+
+
+================================================================================
+STEP 8 — Release build (create the IPA)
+================================================================================
+
+Goal: A release-mode binary, not a debug build.
+
+From the project root folder (where pubspec.yaml is), in Terminal:
+
+  flutter build ipa
+
+Follow the prompts. This produces an IPA suitable for upload (or use Xcode
+Archive below).
+
+Alternative: Xcode Archive
+
+1. Open ios/Runner.xcworkspace in Xcode.
+
+2. At the top, set the run destination to “Any iOS Device” or a generic iOS
+   device (not a simulator).
+
+3. Menu: Product → Archive.
+
+4. When the archive finishes, the Organizer window opens → Distribute App →
+   App Store Connect → Upload.
+
+Files: No manual file edits; output builds go to DerivedData / Organizer (Xcode
+manages those).
+
+
+================================================================================
+STEP 9 — Upload the build to App Store Connect
+================================================================================
+
+Goal: Apple has your binary and is processing it.
+
+1. If you used `flutter build ipa`, you can upload with Transporter (Mac App
+   Store) or Xcode’s Organizer, depending on where Flutter exported the IPA.
+
+2. If you used Xcode Archive → Distribute App, follow the upload wizard.
+
+3. Wait. Processing often takes 10–30 minutes (sometimes longer). In App Store
+   Connect → your app → TestFlight or the version page, the build will appear
+   when ready. Fix any email from Apple about missing compliance or symbols.
+
+
+Files: None.
+
+
+================================================================================
+STEP 10 — Test on a real iPhone (strongly recommended)
+================================================================================
+
+Goal: Catch crashes and layout issues before Apple’s reviewers see them.
+
+1. In App Store Connect, use TestFlight to add internal testers (your Apple ID)
+   and install the build on your phone.
+
+2. Or connect the iPhone with USB, trust the computer, select the device in Xcode,
+   and run (still need proper signing).
+
+Files: None.
+
+
+================================================================================
+STEP 11 — Store listing in App Store Connect
+================================================================================
+
+Goal: The public page (screenshots, description, support links) is complete.
+
+1. In App Store Connect, open your app → App Store tab → prepare the version.
+
+2. Required items usually include:
+   • Screenshots for required iPhone display sizes (Apple documents current sizes;
+     use Simulator or device to capture).
+   • Description, keywords, support URL.
+   • Privacy policy URL (often required; host a simple page if needed).
+   • App Privacy: answer questions about data collection (location, etc.).
+   • Age rating questionnaire.
+
+3. Export / compliance questions: answer honestly (e.g. encryption, if asked).
+
+
+Files: None in the repo; screenshots are images you upload to the website.
+
+
+================================================================================
+STEP 12 — Submit for review
+================================================================================
+
+Goal: Apple reviews the app for policy and stability.
+
+1. In the version page, attach the processed build.
+
+2. Fill in “Review Notes” if testers need steps (e.g. “Open Settings → …”).
+
+3. If the app requires login, provide a demo account if possible.
+
+4. Submit for review.
+
+5. Wait for email updates (approved, rejected, or more info needed).
+
+
+================================================================================
+STEP 13 — Release
+================================================================================
+
+After approval, choose automatic release or manual release in App Store Connect.
+Then the app appears on the store according to your choice.
+
+
+================================================================================
+Troubleshooting tips
+================================================================================
+
+• “No such team” or signing errors: Confirm you paid the Developer Program fee,
+  signed in to Xcode with the correct Apple ID (Xcode → Settings → Accounts).
+
+• Bundle ID mismatch: The string in Xcode → Runner → Signing must match App
+  Store Connect exactly (character for character).
+
+• Old com.example bundle ID: Change it in Xcode (Step 4); never ship production
+  with com.example.
+
+• Build number rejected: Increment Build in Xcode / pubspec and upload again.
+
+• Flutter-specific issues: Run `flutter doctor -v` and fix iOS toolchain items.
+
+
+================================================================================
+Quick reference — files in this repo
+================================================================================
+
+  pubspec.yaml                    App version + build for Flutter
+  ios/Runner.xcworkspace          Open this in Xcode (not .xcodeproj alone)
+  ios/Runner.xcodeproj/project.pbxproj   Bundle IDs (usually edited via Xcode)
+  ios/Runner/Info.plist           Permission strings, bundle placeholders
+  ios/Runner/Assets.xcassets/AppIcon.appiconset/   App icons
+  ios/Runner/Base.lproj/LaunchScreen.storyboard   Launch screen
+
+
+For everything else (account, certificates, screenshots, review), use Apple’s
+websites: developer.apple.com and appstoreconnect.apple.com.
