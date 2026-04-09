@@ -174,7 +174,8 @@ class _RowData {
   });
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen>
+    with SingleTickerProviderStateMixin {
   final storage = Storage();
   final uuid = const Uuid();
 
@@ -218,10 +219,41 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<List<_RowData>>? _rowsFuture;
 
+  /// Avoid refetching map polygons/notes on every selection toggle.
+  Future<List<dynamic>>? _mapTabDataFuture;
+
+  static const Duration _grazingBarDropDuration = Duration(milliseconds: 340);
+
+  late final AnimationController _grazingBarDropController;
+
   @override
   void initState() {
     super.initState();
+    _grazingBarDropController = AnimationController(
+      vsync: this,
+      duration: _grazingBarDropDuration,
+    );
     _load();
+  }
+
+  @override
+  void dispose() {
+    _grazingBarDropController.dispose();
+    super.dispose();
+  }
+
+  void _playGrazingBarDropIn() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _grazingBarDropController.forward(from: 0);
+    });
+  }
+
+  void _resetGrazingBarDrop() {
+    if (_grazingBarDropController.isAnimating) {
+      _grazingBarDropController.stop();
+    }
+    _grazingBarDropController.reset();
   }
 
   Future<void> _load() async {
@@ -229,6 +261,7 @@ class _HomeScreenState extends State<HomeScreen> {
     paddocks.sort((a, b) => a.recordOrder.compareTo(b.recordOrder));
     loaded = true;
     _rowsFuture = _buildRows();
+    _mapTabDataFuture = null;
     if (mounted) setState(() {});
   }
 
@@ -262,12 +295,22 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<List<_RowData>> _buildRows() async {
     final now = DateTime.now();
 
-    final farmGrowth = await storage.effectiveFarmGrowthKgDmPerHaPerDay();
+    final manualGrowth = await storage.loadManualFarmGrowthKgDmPerHaPerDay();
+    final batch = await Future.wait([
+      storage.loadAllMeasurements(),
+      storage.loadAllGrazings(),
+      storage.loadAllNotes(),
+    ]);
+    final msAll = batch[0] as List<Measurement>;
+    final gsAll = batch[1] as List<Grazing>;
+    final notesAll = batch[2] as List<NoteEntry>;
 
-    // Batch-load once to avoid per-paddock SharedPreferences reads.
-    final msAll = await storage.loadAllMeasurements();
-    final gsAll = await storage.loadAllGrazings();
-    final notesAll = await storage.loadAllNotes();
+    final includedIds = paddocks
+        .where((p) => p.includeInRotation)
+        .map((p) => p.id)
+        .toSet();
+    final farmGrowth = manualGrowth ??
+        storage.computeFarmGrowthFromLoadedData(msAll, gsAll, includedIds);
 
     final msByPdk = <String, List<Measurement>>{};
     for (final m in msAll) {
@@ -425,9 +468,16 @@ class _HomeScreenState extends State<HomeScreen> {
       selectionMode = true;
       selectedPaddockIds.add(paddockId);
     });
+    _playGrazingBarDropIn();
   }
 
   void _toggleSelected(String paddockId) {
+    final willExit =
+        selectedPaddockIds.contains(paddockId) &&
+        selectedPaddockIds.length == 1;
+    if (willExit) {
+      _resetGrazingBarDrop();
+    }
     setState(() {
       if (selectedPaddockIds.contains(paddockId)) {
         selectedPaddockIds.remove(paddockId);
@@ -441,10 +491,66 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _cancelSelection() {
+    _resetGrazingBarDrop();
     setState(() {
       selectionMode = false;
       selectedPaddockIds.clear();
     });
+  }
+
+  double _selectedAreaHa(List<_RowData> rows) {
+    var sum = 0.0;
+    for (final r in rows) {
+      if (selectedPaddockIds.contains(r.paddock.id)) {
+        sum += r.paddock.areaHa;
+      }
+    }
+    return sum;
+  }
+
+  Widget _grazingBar(List<_RowData> rows) {
+    final areaHa = _selectedAreaHa(rows);
+    return _GrazingBar(
+      residual: residual,
+      selectedCount: selectedPaddockIds.length,
+      selectedAreaHa: areaHa,
+      onResidualChanged: (v) => setState(() => residual = clampCover(v)),
+      onUndo: selectedPaddockIds.isEmpty ? null : _undoGrazing,
+      onPreview: selectedPaddockIds.isEmpty
+          ? null
+          : (range) async {
+              final selected = rows
+                  .where((r) => selectedPaddockIds.contains(r.paddock.id))
+                  .map(
+                    (r) => GrazingSchedulePaddock(
+                      id: r.paddock.id,
+                      name: r.paddock.name,
+                      areaHa: r.paddock.areaHa,
+                      predictedCoverKgDmHa: r.predicted,
+                    ),
+                  )
+                  .toList();
+
+              final saved = await Navigator.of(context).push<bool>(
+                MaterialPageRoute(
+                  builder: (_) => GrazingSchedulePreviewScreen(
+                    paddocks: selected,
+                    range: range,
+                    residualKgDmHa: residual,
+                  ),
+                ),
+              );
+
+              if (saved == true) {
+                _resetGrazingBarDrop();
+                setState(() {
+                  selectionMode = false;
+                  selectedPaddockIds.clear();
+                });
+                await _refreshHome();
+              }
+            },
+    );
   }
 
   Future<void> _undoGrazing() async {
@@ -467,6 +573,7 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
 
+    _resetGrazingBarDrop();
     setState(() {
       selectionMode = false;
       selectedPaddockIds.clear();
@@ -516,13 +623,54 @@ class _HomeScreenState extends State<HomeScreen> {
                     if (!selectionMode) _tabs(),
                     if (!selectionMode)
                       Expanded(
-                        child: _tabIndex == 0
-                            ? _summaryTab(rows)
-                            : (_tabIndex == 1
-                                  ? _paddocksTab(rows)
-                                  : _mapTab(rows)),
+                        child: IndexedStack(
+                          index: _tabIndex,
+                          sizing: StackFit.expand,
+                          children: [
+                            _summaryTab(rows),
+                            _paddocksTab(rows),
+                            _mapTab(rows),
+                          ],
+                        ),
                       ),
-                    if (selectionMode) Expanded(child: _paddocksTab(rows)),
+                    if (selectionMode && _tabIndex == 2)
+                      Expanded(
+                        child: LayoutBuilder(
+                          builder: (context, constraints) {
+                            final maxBarH = (constraints.maxHeight * 0.5)
+                                .clamp(120.0, 520.0);
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                _grazingBarAnimatedShell(
+                                  child: Material(
+                                    elevation: 6,
+                                    shadowColor: Colors.black.withValues(
+                                      alpha: 0.35,
+                                    ),
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .surfaceContainerHighest
+                                        .withValues(alpha: 0.97),
+                                    child: ConstrainedBox(
+                                      constraints: BoxConstraints(
+                                        maxHeight: maxBarH,
+                                      ),
+                                      child: SingleChildScrollView(
+                                        physics: const ClampingScrollPhysics(),
+                                        child: _grazingBar(rows),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                Expanded(child: _mapTab(rows)),
+                              ],
+                            );
+                          },
+                        ),
+                      ),
+                    if (selectionMode && _tabIndex != 2)
+                      Expanded(child: _paddocksTab(rows)),
                   ],
                 );
               },
@@ -531,35 +679,99 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _tabs() {
+    final cs = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-      child: SizedBox(
-        height: 34,
-        child: SegmentedButton<int>(
-          showSelectedIcon: false,
-          style: const ButtonStyle(
-            visualDensity: VisualDensity.compact,
-            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: cs.surfaceContainerHighest.withValues(alpha: 0.65),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: cs.outlineVariant.withValues(alpha: 0.45),
           ),
-          segments: const [
-            ButtonSegment(
-              value: 0,
-              label: SizedBox(width: 96, child: Center(child: Text('Summary'))),
-            ),
-            ButtonSegment(
-              value: 1,
-              label: SizedBox(
-                width: 96,
-                child: Center(child: Text('Paddocks')),
-              ),
-            ),
-            ButtonSegment(
-              value: 2,
-              label: SizedBox(width: 96, child: Center(child: Text('Map'))),
+          boxShadow: [
+            BoxShadow(
+              color: cs.shadow.withValues(alpha: 0.06),
+              blurRadius: 10,
+              offset: const Offset(0, 3),
             ),
           ],
-          selected: {_tabIndex},
-          onSelectionChanged: (s) => setState(() => _tabIndex = s.first),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: SizedBox(
+            height: 46,
+            child: Row(
+              children: [
+                Expanded(child: _homeTabSegment(0, 'Summary')),
+                Expanded(child: _homeTabSegment(1, 'Paddocks')),
+                Expanded(child: _homeTabSegment(2, 'Map')),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _homeTabSegment(int index, String label) {
+    final cs = Theme.of(context).colorScheme;
+    final selected = _tabIndex == index;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => setState(() => _tabIndex = index),
+          borderRadius: BorderRadius.circular(14),
+          splashColor: cs.primary.withValues(alpha: 0.12),
+          highlightColor: cs.primary.withValues(alpha: 0.06),
+          child: Semantics(
+            button: true,
+            selected: selected,
+            label: label,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 240),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment.center,
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 10),
+              decoration: BoxDecoration(
+                color: selected ? cs.primaryContainer : Colors.transparent,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: selected
+                      ? cs.primary.withValues(alpha: 0.22)
+                      : Colors.transparent,
+                  width: 1,
+                ),
+                boxShadow: selected
+                    ? [
+                        BoxShadow(
+                          color: cs.primary.withValues(alpha: 0.14),
+                          blurRadius: 6,
+                          offset: const Offset(0, 2),
+                        ),
+                      ]
+                    : null,
+              ),
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 13.5,
+                  letterSpacing: 0.15,
+                  fontWeight: selected ? FontWeight.w800 : FontWeight.w600,
+                  color: selected
+                      ? cs.onPrimaryContainer
+                      : cs.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ),
         ),
       ),
     );
@@ -569,7 +781,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final byId = {for (final r in rows) r.paddock.id: r};
 
     return FutureBuilder<List<dynamic>>(
-      future: Future.wait([
+      future: _mapTabDataFuture ??= Future.wait([
         storage.loadFarmMapPolygons(),
         storage.loadAllNotes(),
         storage.loadHiddenSummaryNoteIds(),
@@ -696,7 +908,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       initialZoom: 15,
                       onMapEvent: (e) {
                         final z = e.camera.zoom;
-                        if (z != _mapZoom) {
+                        // Epsilon avoids setState storms from float noise / programmatic moves.
+                        if ((z - _mapZoom).abs() > 1e-4) {
                           setState(() => _mapZoom = z);
                         }
                       },
@@ -712,6 +925,10 @@ class _HomeScreenState extends State<HomeScreen> {
                         if (hitId == null) return;
                         final r = byId[hitId];
                         if (r == null) return;
+                        if (selectionMode) {
+                          _toggleSelected(hitId);
+                          return;
+                        }
                         await Navigator.of(context).push(
                           MaterialPageRoute(
                             builder: (_) =>
@@ -719,6 +936,13 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         );
                         await _refreshHome();
+                      },
+                      onLongPress: (tapPosition, point) {
+                        final hitId = _hitTest(point, mapPolys);
+                        if (hitId == null) return;
+                        if (byId[hitId] == null) return;
+                        if (selectionMode) return;
+                        _enterSelectionMode(hitId);
                       },
                     ),
                     children: [
@@ -729,14 +953,19 @@ class _HomeScreenState extends State<HomeScreen> {
                       PolygonLayer(
                         polygons: mapPolys.map((p) {
                           final c = _heatColorForCover(p.predicted);
+                          final sel =
+                              selectionMode &&
+                              selectedPaddockIds.contains(p.paddockId);
                           return Polygon(
                             points: p.rings.first,
-                            borderColor: Colors.black.withValues(alpha: 0.55),
-                            borderStrokeWidth: 1.6,
+                            borderColor: sel
+                                ? Colors.blue.shade700
+                                : Colors.black.withValues(alpha: 0.55),
+                            borderStrokeWidth: sel ? 3.2 : 1.6,
                             isFilled: true,
                             color: p.excluded
                                 ? Colors.grey.withValues(alpha: 0.25)
-                                : c.withValues(alpha: 0.78),
+                                : c.withValues(alpha: sel ? 0.88 : 0.78),
                           );
                         }).toList(),
                       ),
@@ -1161,6 +1390,34 @@ class _HomeScreenState extends State<HomeScreen> {
           height: 64,
           child: FilledButton(
             onPressed: () async {
+              if (included.isEmpty) {
+                if (!context.mounted) return;
+                await showDialog<void>(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    icon: Icon(
+                      Icons.warning_amber_rounded,
+                      color: Colors.orange.shade800,
+                      size: 36,
+                    ),
+                    title: const Text('Add paddocks first'),
+                    content: const Text(
+                      'You need at least one paddock included in your rotation '
+                      'before you can record covers.\n\n'
+                      'Open Settings (the gear icon): use Add / edit paddocks to '
+                      'add paddocks and turn on “Include in rotation”, and use '
+                      'Recording order to set the walk order.',
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        child: const Text('OK'),
+                      ),
+                    ],
+                  ),
+                );
+                return;
+              }
               await Navigator.of(
                 context,
               ).push(MaterialPageRoute(builder: (_) => const RoundScreen()));
@@ -1999,48 +2256,37 @@ class _HomeScreenState extends State<HomeScreen> {
     await _refreshHome();
   }
 
+  /// Reveals the grazing bar by growing height from the top; content below in
+  /// the parent [Column] moves down in sync (map or paddock list).
+  Widget _grazingBarAnimatedShell({required Widget child}) {
+    return ClipRect(
+      clipBehavior: Clip.hardEdge,
+      child: SizeTransition(
+        sizeFactor: CurvedAnimation(
+          parent: _grazingBarDropController,
+          curve: Curves.easeOutCubic,
+        ),
+        axis: Axis.vertical,
+        axisAlignment: -1,
+        child: child,
+      ),
+    );
+  }
+
   Widget _paddocksTab(List<_RowData> rows) {
     return Column(
       children: [
         if (selectionMode)
-          _GrazingBar(
-            residual: residual,
-            selectedCount: selectedPaddockIds.length,
-            onResidualChanged: (v) => setState(() => residual = clampCover(v)),
-            onUndo: selectedPaddockIds.isEmpty ? null : _undoGrazing,
-            onPreview: selectedPaddockIds.isEmpty
-                ? null
-                : (range) async {
-                    final selected = rows
-                        .where((r) => selectedPaddockIds.contains(r.paddock.id))
-                        .map(
-                          (r) => GrazingSchedulePaddock(
-                            id: r.paddock.id,
-                            name: r.paddock.name,
-                            areaHa: r.paddock.areaHa,
-                            predictedCoverKgDmHa: r.predicted,
-                          ),
-                        )
-                        .toList();
-
-                    final saved = await Navigator.of(context).push<bool>(
-                      MaterialPageRoute(
-                        builder: (_) => GrazingSchedulePreviewScreen(
-                          paddocks: selected,
-                          range: range,
-                          residualKgDmHa: residual,
-                        ),
-                      ),
-                    );
-
-                    if (saved == true) {
-                      setState(() {
-                        selectionMode = false;
-                        selectedPaddockIds.clear();
-                      });
-                      await _refreshHome();
-                    }
-                  },
+          _grazingBarAnimatedShell(
+            child: Material(
+              elevation: 6,
+              shadowColor: Colors.black.withValues(alpha: 0.35),
+              color: Theme.of(context)
+                  .colorScheme
+                  .surfaceContainerHighest
+                  .withValues(alpha: 0.97),
+              child: _grazingBar(rows),
+            ),
           ),
         _stickyHeader(),
         const Divider(height: 1),
@@ -2570,6 +2816,7 @@ class _FeedWedgePainter extends CustomPainter {
 class _GrazingBar extends StatefulWidget {
   final int residual;
   final int selectedCount;
+  final double selectedAreaHa;
   final ValueChanged<int> onResidualChanged;
   final VoidCallback? onUndo;
   final ValueChanged<DateTimeRange>? onPreview;
@@ -2577,6 +2824,7 @@ class _GrazingBar extends StatefulWidget {
   const _GrazingBar({
     required this.residual,
     required this.selectedCount,
+    this.selectedAreaHa = 0,
     required this.onResidualChanged,
     required this.onUndo,
     required this.onPreview,
@@ -2657,10 +2905,13 @@ class _GrazingBarState extends State<_GrazingBar> {
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       color: Colors.black.withValues(alpha: 0.04),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Expanded(
+            flex: 3,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
               children: [
                 const Text(
                   'Post grazing residual',
@@ -2689,11 +2940,14 @@ class _GrazingBarState extends State<_GrazingBar> {
                       ),
                     ),
                     const SizedBox(width: 8),
-                    const Text(
-                      'kgDM/ha',
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
+                    const Flexible(
+                      child: Text(
+                        'kgDM/ha',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        overflow: TextOverflow.ellipsis,
                       ),
                     ),
                   ],
@@ -2713,10 +2967,8 @@ class _GrazingBarState extends State<_GrazingBar> {
                   ),
                 ),
                 const SizedBox(height: 6),
-                Wrap(
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  spacing: 8,
-                  runSpacing: 8,
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     SizedBox(
                       height: 40,
@@ -2726,42 +2978,71 @@ class _GrazingBarState extends State<_GrazingBar> {
                         label: const Text('Pick range'),
                       ),
                     ),
-                    Text(
-                      days <= 0
-                          ? ''
-                          : 'Scheduling ${widget.selectedCount} across $days days (~$perDay/day)',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: Colors.black87,
-                        fontWeight: FontWeight.w700,
+                    if (days > 0) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        'Scheduling ${widget.selectedCount} across $days days (~$perDay/day)',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.black87,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
-                    ),
+                    ],
                   ],
                 ),
+                if (widget.selectedCount > 0 && widget.selectedAreaHa > 0) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Selected area: ${widget.selectedAreaHa.toStringAsFixed(1)} ha',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Colors.blue.shade800,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
-          const SizedBox(width: 10),
-          Column(
-            children: [
-              SizedBox(
-                height: 44,
-                child: OutlinedButton(
-                  onPressed: widget.onUndo,
-                  child: const Text('Undo grazing'),
+          const SizedBox(width: 8),
+          Flexible(
+            flex: 2,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  height: 44,
+                  child: OutlinedButton(
+                    onPressed: widget.onUndo,
+                    child: const Text(
+                      'Undo grazing',
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
                 ),
-              ),
-              const SizedBox(height: 8),
-              SizedBox(
-                height: 44,
-                child: ElevatedButton(
-                  onPressed: (widget.onPreview == null || _range == null)
-                      ? null
-                      : () => widget.onPreview!(_range!),
-                  child: Text('Preview (${widget.selectedCount})'),
+                const SizedBox(height: 8),
+                SizedBox(
+                  height: 48,
+                  child: ElevatedButton(
+                    onPressed: (widget.onPreview == null || _range == null)
+                        ? null
+                        : () => widget.onPreview!(_range!),
+                    child: Text(
+                      widget.selectedAreaHa > 0
+                          ? 'Preview (${widget.selectedCount}) · ${widget.selectedAreaHa.toStringAsFixed(1)} ha'
+                          : 'Preview (${widget.selectedCount})',
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 2,
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ],
       ),
