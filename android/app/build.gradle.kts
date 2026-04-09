@@ -51,8 +51,8 @@ android {
         applicationId = "nz.co.kalma.pasturewalk"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
-        versionCode = 2
-        versionName = "2.0.0"
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
     }
 }
 

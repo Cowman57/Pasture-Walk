@@ -21,6 +21,12 @@ class Storage {
   static const _notesKey = 'notes';
   static const _hiddenSummaryNoteIdsKey = 'hidden_summary_note_ids';
 
+  // v2.0.0 Map/GPS keys
+  static const _gpsMeasuringEnabledKey = 'gps_measuring_enabled';
+  static const _farmMapSourceRawKey = 'farm_map_source_raw';
+  static const _farmMapPolygonsKey = 'farm_map_polygons_v1';
+  static const _farmMapImportMetaKey = 'farm_map_import_meta_v1';
+
   // Manual override keys
   static const _manualFarmGrowthKey = 'manual_farm_growth_kgdm_ha_day';
 
@@ -38,6 +44,69 @@ class Storage {
   // -----------------------------
   // SETTINGS
   // -----------------------------
+  Future<bool> loadGpsMeasuringEnabled() async {
+    final sp = await SharedPreferences.getInstance();
+    return sp.getBool(_gpsMeasuringEnabledKey) ?? false;
+  }
+
+  Future<void> saveGpsMeasuringEnabled(bool enabled) async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setBool(_gpsMeasuringEnabledKey, enabled);
+  }
+
+  Future<String?> loadFarmMapSourceRaw() async {
+    final sp = await SharedPreferences.getInstance();
+    return sp.getString(_farmMapSourceRawKey);
+  }
+
+  Future<void> saveFarmMapSourceRaw(String raw) async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setString(_farmMapSourceRawKey, raw);
+  }
+
+  Future<void> clearFarmMap() async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.remove(_farmMapSourceRawKey);
+    await sp.remove(_farmMapPolygonsKey);
+    await sp.remove(_farmMapImportMetaKey);
+  }
+
+  Future<List<Map<String, dynamic>>> loadFarmMapPolygons() async {
+    final sp = await SharedPreferences.getInstance();
+    final raw = sp.getString(_farmMapPolygonsKey);
+    if (raw == null) return <Map<String, dynamic>>[];
+    final decoded = jsonDecode(raw);
+    if (decoded is! List) return <Map<String, dynamic>>[];
+    return decoded
+        .whereType<Map>()
+        .map((e) => Map<String, dynamic>.from(e))
+        .toList();
+  }
+
+  Future<void> saveFarmMapPolygons(List<Map<String, dynamic>> polys) async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setString(_farmMapPolygonsKey, jsonEncode(polys));
+  }
+
+  Future<Map<String, dynamic>?> loadFarmMapImportMeta() async {
+    final sp = await SharedPreferences.getInstance();
+    final raw = sp.getString(_farmMapImportMetaKey);
+    if (raw == null) return null;
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return null;
+    return Map<String, dynamic>.from(decoded);
+  }
+
+  Future<void> saveFarmMapImportMeta(Map<String, dynamic> meta) async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setString(_farmMapImportMetaKey, jsonEncode(meta));
+  }
+
+  Future<bool> hasFarmMap() async {
+    final sp = await SharedPreferences.getInstance();
+    return sp.containsKey(_farmMapPolygonsKey);
+  }
+
   Future<int> loadCoverStep() async {
     final sp = await SharedPreferences.getInstance();
     final v = sp.getInt(_coverStepKey);
@@ -505,6 +574,95 @@ class Storage {
     return out;
   }
 
+  Future<DuplicateGrazingCleanupSummary>
+  cleanupDuplicateGrazingsAllPaddocks() async {
+    const minDropKgDmHa = 200;
+
+    final grazings = await _loadGrazings();
+    if (grazings.isEmpty) {
+      return const DuplicateGrazingCleanupSummary(
+        deletedGrazings: 0,
+        affectedPaddocks: 0,
+      );
+    }
+
+    final msAll = await _loadMeasurements();
+    if (msAll.isEmpty) {
+      return const DuplicateGrazingCleanupSummary(
+        deletedGrazings: 0,
+        affectedPaddocks: 0,
+      );
+    }
+
+    final msByPaddock = <String, List<Measurement>>{};
+    for (final m in msAll) {
+      (msByPaddock[m.paddockId] ??= []).add(m);
+    }
+    for (final e in msByPaddock.entries) {
+      e.value.sort((a, b) => a.at.compareTo(b.at));
+    }
+
+    final toDelete = <String>{};
+    final affectedPaddockIds = <String>{};
+
+    final grazingsByPaddock = <String, List<Grazing>>{};
+    for (final g in grazings) {
+      (grazingsByPaddock[g.paddockId] ??= []).add(g);
+    }
+
+    for (final entry in grazingsByPaddock.entries) {
+      final paddockId = entry.key;
+      final gs = entry.value..sort((a, b) => a.at.compareTo(b.at));
+
+      final ms = msByPaddock[paddockId];
+      if (ms == null || ms.length < 2) continue;
+
+      int mi = 0;
+      for (final g in gs) {
+        while (mi < ms.length && !ms[mi].at.isAfter(g.at)) {
+          mi++;
+        }
+
+        final beforeIndex = mi - 1;
+        if (beforeIndex < 0) continue;
+
+        int afterIndex = mi;
+        while (afterIndex < ms.length && !ms[afterIndex].at.isAfter(g.at)) {
+          afterIndex++;
+        }
+        if (afterIndex >= ms.length) continue;
+
+        final mBefore = ms[beforeIndex];
+        final mAfter = ms[afterIndex];
+
+        final drop = mBefore.cover - mAfter.cover;
+        if (drop < minDropKgDmHa) {
+          toDelete.add(g.id);
+          affectedPaddockIds.add(paddockId);
+        }
+      }
+    }
+
+    if (toDelete.isEmpty) {
+      return const DuplicateGrazingCleanupSummary(
+        deletedGrazings: 0,
+        affectedPaddocks: 0,
+      );
+    }
+
+    final filtered = grazings.where((g) => !toDelete.contains(g.id)).toList();
+    final sp = await SharedPreferences.getInstance();
+    await sp.setString(
+      _grazingsKey,
+      jsonEncode(filtered.map((x) => x.toMap()).toList()),
+    );
+
+    return DuplicateGrazingCleanupSummary(
+      deletedGrazings: toDelete.length,
+      affectedPaddocks: affectedPaddockIds.length,
+    );
+  }
+
   // -----------------------------
   // BACKUP / RESTORE (ALL PREFS)
   // -----------------------------
@@ -629,6 +787,16 @@ class Storage {
       (x) => x.paddockId == paddockId && x.at.isAfter(a) && x.at.isBefore(b),
     );
   }
+}
+
+class DuplicateGrazingCleanupSummary {
+  final int deletedGrazings;
+  final int affectedPaddocks;
+
+  const DuplicateGrazingCleanupSummary({
+    required this.deletedGrazings,
+    required this.affectedPaddocks,
+  });
 }
 
 class Anchor {

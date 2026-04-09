@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 import 'package:uuid/uuid.dart';
+import 'dart:math' as math;
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart' as ll;
+import 'package:proj4dart/proj4dart.dart' as proj4;
 
 import '../models.dart';
 import '../storage.dart';
@@ -16,6 +20,76 @@ class HomeScreen extends StatefulWidget {
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _MapBounds {
+  ll.LatLng southWest;
+  ll.LatLng northEast;
+
+  _MapBounds(this.southWest, this.northEast);
+
+  ll.LatLng get center => ll.LatLng(
+    (southWest.latitude + northEast.latitude) / 2.0,
+    (southWest.longitude + northEast.longitude) / 2.0,
+  );
+
+  void extend(ll.LatLng p) {
+    final minLat = math.min(southWest.latitude, p.latitude);
+    final minLon = math.min(southWest.longitude, p.longitude);
+    final maxLat = math.max(northEast.latitude, p.latitude);
+    final maxLon = math.max(northEast.longitude, p.longitude);
+    southWest = ll.LatLng(minLat, minLon);
+    northEast = ll.LatLng(maxLat, maxLon);
+  }
+}
+
+class _OutlinedLabelLines extends StatelessWidget {
+  final List<String> lines;
+
+  const _OutlinedLabelLines({required this.lines});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = lines.join('\n');
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        SizedBox(
+          width: double.infinity,
+          child: Text(
+            t,
+            textAlign: TextAlign.center,
+            maxLines: lines.length,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              height: 1.05,
+              fontSize: 14,
+              fontWeight: FontWeight.w900,
+              foreground: Paint()
+                ..style = PaintingStyle.stroke
+                ..strokeWidth = 1.6
+                ..color = Colors.white.withValues(alpha: 0.95),
+            ),
+          ),
+        ),
+        SizedBox(
+          width: double.infinity,
+          child: Text(
+            t,
+            textAlign: TextAlign.center,
+            maxLines: lines.length,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              height: 1.05,
+              fontSize: 14,
+              fontWeight: FontWeight.w900,
+              color: Colors.black.withValues(alpha: 0.92),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }
 
 class _AccuracyBar extends StatelessWidget {
@@ -58,6 +132,30 @@ class _AccuracyBar extends StatelessWidget {
   }
 }
 
+class _MapPoly {
+  final String paddockId;
+  final String label;
+  final double areaHa;
+  final bool excluded;
+  final int predicted;
+  final bool pending;
+  final List<List<ll.LatLng>> rings;
+  final _MapBounds bounds;
+  final ll.LatLng centroid;
+
+  const _MapPoly({
+    required this.paddockId,
+    required this.label,
+    required this.areaHa,
+    required this.excluded,
+    required this.predicted,
+    required this.pending,
+    required this.rings,
+    required this.bounds,
+    required this.centroid,
+  });
+}
+
 class _RowData {
   final Paddock paddock;
   final int? lastCover; // last recorded cover measurement
@@ -79,6 +177,21 @@ class _RowData {
 class _HomeScreenState extends State<HomeScreen> {
   final storage = Storage();
   final uuid = const Uuid();
+
+  final MapController _mapController = MapController();
+  bool _mapFitApplied = false;
+  int _mapLayer = 1;
+  double _mapZoom = 15;
+
+  late final proj4.Projection _wgs84 =
+      proj4.Projection.get('EPSG:4326') ?? proj4.Projection.WGS84;
+
+  late final proj4.Projection _nztm =
+      proj4.Projection.get('EPSG:2193') ??
+      proj4.Projection.add(
+        'EPSG:2193',
+        '+proj=tmerc +lat_0=0 +lon_0=173 +k=0.9996 +x_0=1600000 +y_0=10000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs',
+      );
 
   bool loaded = false;
   List<Paddock> paddocks = [];
@@ -186,7 +299,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final list = msByPdk[p.id] ?? const <Measurement>[];
       final lastCoverM = list.isEmpty ? null : list.first;
 
-      // ✅ note icon: show if note added today
+      // note icon: show if note added today
       final lastNote = lastNoteByPdk[p.id];
       final hasRecentNote = lastNote != null && _sameDay(lastNote.at, now);
 
@@ -201,7 +314,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       int predicted;
 
-      // ✅ Cropped paddocks: predicted cover should be 0 so sorting doesn't float them up at 2500
+      // Cropped paddocks: predicted cover should be 0 so sorting doesn't float them up at 2500
       if (!p.includeInRotation) {
         predicted = 0;
       } else {
@@ -405,7 +518,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       Expanded(
                         child: _tabIndex == 0
                             ? _summaryTab(rows)
-                            : _paddocksTab(rows),
+                            : (_tabIndex == 1
+                                  ? _paddocksTab(rows)
+                                  : _mapTab(rows)),
                       ),
                     if (selectionMode) Expanded(child: _paddocksTab(rows)),
                   ],
@@ -418,14 +533,604 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _tabs() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-      child: SegmentedButton<int>(
-        segments: const [
-          ButtonSegment(value: 0, label: Text('Summary')),
-          ButtonSegment(value: 1, label: Text('Paddocks')),
-        ],
-        selected: {_tabIndex},
-        onSelectionChanged: (s) => setState(() => _tabIndex = s.first),
+      child: SizedBox(
+        height: 34,
+        child: SegmentedButton<int>(
+          showSelectedIcon: false,
+          style: const ButtonStyle(
+            visualDensity: VisualDensity.compact,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          segments: const [
+            ButtonSegment(
+              value: 0,
+              label: SizedBox(width: 96, child: Center(child: Text('Summary'))),
+            ),
+            ButtonSegment(
+              value: 1,
+              label: SizedBox(
+                width: 96,
+                child: Center(child: Text('Paddocks')),
+              ),
+            ),
+            ButtonSegment(
+              value: 2,
+              label: SizedBox(width: 96, child: Center(child: Text('Map'))),
+            ),
+          ],
+          selected: {_tabIndex},
+          onSelectionChanged: (s) => setState(() => _tabIndex = s.first),
+        ),
       ),
+    );
+  }
+
+  Widget _mapTab(List<_RowData> rows) {
+    final byId = {for (final r in rows) r.paddock.id: r};
+
+    return FutureBuilder<List<dynamic>>(
+      future: Future.wait([
+        storage.loadFarmMapPolygons(),
+        storage.loadAllNotes(),
+        storage.loadHiddenSummaryNoteIds(),
+      ]),
+      builder: (context, snap) {
+        if (!snap.hasData) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        final polys = (snap.data![0] as List)
+            .whereType<Map>()
+            .map((e) => Map<String, dynamic>.from(e))
+            .toList();
+        final notes = (snap.data![1] as List<NoteEntry>);
+        final hidden = (snap.data![2] as Set<String>);
+
+        if (polys.isEmpty) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.map_outlined, size: 48),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'No map imported',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Import a farm map (GeoJSON or Shapefile zip) from Settings to enable the map view.',
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 12),
+                  FilledButton(
+                    onPressed: () async {
+                      await Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => const SettingsScreen(),
+                        ),
+                      );
+                      await _refreshHome();
+                    },
+                    child: const Text('Open Settings'),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+
+        final pendingByPdk = <String, bool>{};
+        for (final n in notes) {
+          if (hidden.contains(n.id)) continue;
+          pendingByPdk[n.paddockId] = true;
+        }
+
+        final mapPolys = _buildMapPolys(polys, byId, pendingByPdk);
+        final farmBounds = _boundsForMapPolys(mapPolys);
+
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            if (!_mapFitApplied && mapPolys.isNotEmpty && farmBounds != null) {
+              _mapFitApplied = true;
+            }
+
+            if (mapPolys.isEmpty) {
+              return Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.map_outlined, size: 48),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Map could not be rendered',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'The imported file contained no valid paddock polygons to display.',
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 12),
+                      FilledButton(
+                        onPressed: () async {
+                          await Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => const SettingsScreen(),
+                            ),
+                          );
+                          await _refreshHome();
+                        },
+                        child: const Text('Open Settings'),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+
+            final bg = (_mapLayer == 1)
+                ? Colors.black.withValues(alpha: 0.04)
+                : Colors.white;
+
+            final tileUrl = _mapLayer == 0
+                ? 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+                : 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+
+            return Stack(
+              children: [
+                Positioned.fill(child: ColoredBox(color: bg)),
+                Positioned.fill(
+                  child: FlutterMap(
+                    mapController: _mapController,
+                    options: MapOptions(
+                      initialCenter:
+                          farmBounds?.center ?? const ll.LatLng(0, 0),
+                      initialZoom: 15,
+                      onMapEvent: (e) {
+                        final z = e.camera.zoom;
+                        if (z != _mapZoom) {
+                          setState(() => _mapZoom = z);
+                        }
+                      },
+                      interactionOptions: const InteractionOptions(
+                        flags:
+                            InteractiveFlag.drag |
+                            InteractiveFlag.pinchZoom |
+                            InteractiveFlag.doubleTapZoom |
+                            InteractiveFlag.flingAnimation,
+                      ),
+                      onTap: (tapPosition, point) async {
+                        final hitId = _hitTest(point, mapPolys);
+                        if (hitId == null) return;
+                        final r = byId[hitId];
+                        if (r == null) return;
+                        await Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) =>
+                                PaddockHistoryScreen(paddock: r.paddock),
+                          ),
+                        );
+                        await _refreshHome();
+                      },
+                    ),
+                    children: [
+                      TileLayer(
+                        urlTemplate: tileUrl,
+                        userAgentPackageName: 'pasture_walk',
+                      ),
+                      PolygonLayer(
+                        polygons: mapPolys.map((p) {
+                          final c = _heatColorForCover(p.predicted);
+                          return Polygon(
+                            points: p.rings.first,
+                            borderColor: Colors.black.withValues(alpha: 0.55),
+                            borderStrokeWidth: 1.6,
+                            isFilled: true,
+                            color: p.excluded
+                                ? Colors.grey.withValues(alpha: 0.25)
+                                : c.withValues(alpha: 0.78),
+                          );
+                        }).toList(),
+                      ),
+                      PolylineLayer(
+                        polylines: () {
+                          final out = <Polyline>[];
+                          for (final p in mapPolys) {
+                            if (!p.pending) continue;
+                            if (p.rings.isEmpty || p.rings.first.length < 2) {
+                              continue;
+                            }
+                            out.add(_solidRing(p.rings.first));
+                          }
+                          return out;
+                        }(),
+                      ),
+                      MarkerLayer(
+                        markers: () {
+                          final ref = _avgBoundsPx(mapPolys, _mapZoom);
+                          final out = <Marker>[];
+
+                          for (final p in mapPolys) {
+                            final lines = _labelLines(p, ref);
+                            final opacity = _labelOpacity(lines, ref, _mapZoom);
+                            final show3 = lines.length >= 3;
+
+                            if (p.pending && show3) {
+                              out.add(
+                                Marker(
+                                  point: p.centroid,
+                                  width: 22,
+                                  height: 22,
+                                  alignment: Alignment.topRight,
+                                  child: Transform.translate(
+                                    offset: const Offset(18, -16),
+                                    child: Container(
+                                      width: 22,
+                                      height: 22,
+                                      decoration: BoxDecoration(
+                                        color: Colors.white.withValues(
+                                          alpha: 0.92,
+                                        ),
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(
+                                          color: Colors.black.withValues(
+                                            alpha: 0.20,
+                                          ),
+                                        ),
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: Colors.black.withValues(
+                                              alpha: 0.10,
+                                            ),
+                                            blurRadius: 6,
+                                            offset: const Offset(0, 2),
+                                          ),
+                                        ],
+                                      ),
+                                      child: Icon(
+                                        Icons.note_alt_outlined,
+                                        size: 16,
+                                        color: Colors.black.withValues(
+                                          alpha: 0.75,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }
+
+                            final w = math.max(
+                              110.0,
+                              math.min(180.0, ref.width * 0.85),
+                            );
+                            final hBase = 26.0;
+                            final h = hBase + (lines.length - 1) * 16.0;
+
+                            out.add(
+                              Marker(
+                                point: p.centroid,
+                                width: w,
+                                height: h,
+                                alignment: Alignment.center,
+                                child: Opacity(
+                                  opacity: opacity,
+                                  child: _OutlinedLabelLines(lines: lines),
+                                ),
+                              ),
+                            );
+                          }
+
+                          return out;
+                        }(),
+                      ),
+                    ],
+                  ),
+                ),
+                Positioned(
+                  right: 12,
+                  top: 12,
+                  child: FloatingActionButton.small(
+                    heroTag: 'map-layer',
+                    onPressed: () {
+                      setState(() {
+                        _mapLayer = (_mapLayer + 1) % 2;
+                      });
+                    },
+                    child: const Icon(Icons.layers_outlined),
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Color _heatColorForCover(int cover) {
+    final v = cover.toDouble();
+    if (v <= 1200) return Colors.red;
+    if (v <= 1600) {
+      final t = ((v - 1200) / (1600 - 1200)).clamp(0.0, 1.0);
+      return Color.lerp(Colors.red, Colors.yellow, t) ?? Colors.yellow;
+    }
+    if (v <= 2800) {
+      final t = ((v - 1600) / (2800 - 1600)).clamp(0.0, 1.0);
+      return Color.lerp(Colors.yellow, Colors.green, t) ?? Colors.green;
+    }
+    if (v <= 3200) {
+      final t = ((v - 2800) / (3200 - 2800)).clamp(0.0, 1.0);
+      return Color.lerp(Colors.green, Colors.blue, t) ?? Colors.blue;
+    }
+    return Colors.blue;
+  }
+
+  _MapBounds? _boundsForMapPolys(List<_MapPoly> polys) {
+    if (polys.isEmpty) return null;
+    final b = _MapBounds(
+      polys.first.bounds.southWest,
+      polys.first.bounds.northEast,
+    );
+    for (final p in polys.skip(1)) {
+      b.extend(p.bounds.southWest);
+      b.extend(p.bounds.northEast);
+    }
+    return b;
+  }
+
+  List<_MapPoly> _buildMapPolys(
+    List<Map<String, dynamic>> polys,
+    Map<String, _RowData> byId,
+    Map<String, bool> pendingByPdk,
+  ) {
+    final out = <_MapPoly>[];
+    for (final p in polys) {
+      final paddockId = p['paddockId']?.toString();
+      if (paddockId == null || paddockId.isEmpty) continue;
+      final row = byId[paddockId];
+      if (row == null) continue;
+
+      final ringsAny = p['polys'];
+      if (ringsAny is! List) continue;
+
+      final rings = <List<ll.LatLng>>[];
+      for (final ringAny in ringsAny) {
+        if (ringAny is! List) continue;
+        final pts = <ll.LatLng>[];
+        var invalid = false;
+        for (final xyAny in ringAny) {
+          if (xyAny is! List) continue;
+          if (xyAny.length < 2) continue;
+          final a = (xyAny[0] as num?)?.toDouble();
+          final b = (xyAny[1] as num?)?.toDouble();
+          if (a == null || b == null) continue;
+
+          // Prefer GeoJSON-style [lon, lat] degrees.
+          // If coords look projected (meters), transform NZTM -> WGS84.
+          // If degrees appear swapped, swap.
+          ll.LatLng? pt;
+          final degOk = (b >= -90 && b <= 90 && a >= -180 && a <= 180);
+          if (degOk) {
+            pt = ll.LatLng(b, a);
+          } else {
+            final swappedDegOk = (a >= -90 && a <= 90 && b >= -180 && b <= 180);
+            if (swappedDegOk) {
+              pt = ll.LatLng(a, b);
+            } else {
+              // Heuristic: NZTM eastings/northings are ~1,000,000 to 2,500,000 / 4,000,000 to 10,000,000.
+              final looksProjected = a.abs() > 1000 && b.abs() > 1000;
+              if (looksProjected) {
+                try {
+                  final pWgs = _nztm.transform(_wgs84, proj4.Point(x: a, y: b));
+                  final lon = pWgs.x.toDouble();
+                  final lat = pWgs.y.toDouble();
+                  if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+                    pt = ll.LatLng(lat, lon);
+                  }
+                } catch (_) {
+                  // ignore and mark invalid below
+                }
+              }
+            }
+          }
+
+          if (pt == null) {
+            invalid = true;
+            break;
+          }
+          pts.add(pt);
+        }
+        if (!invalid && pts.length >= 3) {
+          rings.add(pts);
+        }
+      }
+      if (rings.isEmpty) continue;
+
+      var minLat = double.infinity;
+      var minLon = double.infinity;
+      var maxLat = -double.infinity;
+      var maxLon = -double.infinity;
+      for (final r in rings) {
+        for (final pt in r) {
+          minLat = math.min(minLat, pt.latitude);
+          minLon = math.min(minLon, pt.longitude);
+          maxLat = math.max(maxLat, pt.latitude);
+          maxLon = math.max(maxLon, pt.longitude);
+        }
+      }
+      if (!minLat.isFinite ||
+          !minLon.isFinite ||
+          !maxLat.isFinite ||
+          !maxLon.isFinite) {
+        continue;
+      }
+
+      final bounds = _MapBounds(
+        ll.LatLng(minLat, minLon),
+        ll.LatLng(maxLat, maxLon),
+      );
+
+      final centroid = _centroidForRing(rings.first) ?? bounds.center;
+      out.add(
+        _MapPoly(
+          paddockId: paddockId,
+          label: row.paddock.name,
+          areaHa: row.paddock.areaHa,
+          excluded: !row.paddock.includeInRotation,
+          predicted: row.predicted,
+          pending: pendingByPdk[paddockId] == true,
+          rings: rings,
+          bounds: bounds,
+          centroid: centroid,
+        ),
+      );
+    }
+    return out;
+  }
+
+  String? _hitTest(ll.LatLng p, List<_MapPoly> polys) {
+    for (final poly in polys.reversed) {
+      if (_pointInRing(p, poly.rings.first)) return poly.paddockId;
+    }
+    return null;
+  }
+
+  bool _pointInRing(ll.LatLng p, List<ll.LatLng> ring) {
+    bool inside = false;
+    for (int i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      final xi = ring[i].longitude;
+      final yi = ring[i].latitude;
+      final xj = ring[j].longitude;
+      final yj = ring[j].latitude;
+
+      final intersect =
+          ((yi > p.latitude) != (yj > p.latitude)) &&
+          (p.longitude <
+              (xj - xi) *
+                      (p.latitude - yi) /
+                      ((yj - yi) == 0 ? 1e-12 : (yj - yi)) +
+                  xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  ll.LatLng? _centroidForRing(List<ll.LatLng> ring) {
+    if (ring.length < 3) return null;
+    double a = 0;
+    double cx = 0;
+    double cy = 0;
+    for (int i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      final x0 = ring[j].longitude;
+      final y0 = ring[j].latitude;
+      final x1 = ring[i].longitude;
+      final y1 = ring[i].latitude;
+      final f = (x0 * y1) - (x1 * y0);
+      a += f;
+      cx += (x0 + x1) * f;
+      cy += (y0 + y1) * f;
+    }
+    a *= 0.5;
+    if (a.abs() < 1e-12) return null;
+    cx /= (6.0 * a);
+    cy /= (6.0 * a);
+    if (cy < -90 || cy > 90 || cx < -180 || cx > 180) return null;
+    return ll.LatLng(cy, cx);
+  }
+
+  Size _boundsPx(_MapBounds b, double zoom) {
+    final z = zoom.clamp(0.0, 22.0);
+    final scale = 256.0 * math.pow(2.0, z);
+
+    double mercY(double lat) {
+      final r = lat.clamp(-85.05112878, 85.05112878) * math.pi / 180.0;
+      return math.log(math.tan((math.pi / 4.0) + (r / 2.0)));
+    }
+
+    final dLon = (b.northEast.longitude - b.southWest.longitude).abs();
+    final w = (dLon * scale / 360.0);
+
+    final y0 = mercY(b.southWest.latitude);
+    final y1 = mercY(b.northEast.latitude);
+    final h = ((y1 - y0).abs() * scale / (2.0 * math.pi));
+    return Size(w.isFinite ? w : 0, h.isFinite ? h : 0);
+  }
+
+  Size _avgBoundsPx(List<_MapPoly> polys, double zoom) {
+    if (polys.isEmpty) return const Size(0, 0);
+    double sw = 0;
+    double sh = 0;
+    int n = 0;
+    for (final p in polys) {
+      final sz = _boundsPx(p.bounds, zoom);
+      if (sz.width <= 0 || sz.height <= 0) continue;
+      sw += sz.width;
+      sh += sz.height;
+      n++;
+    }
+    if (n == 0) return const Size(0, 0);
+    return Size(sw / n, sh / n);
+  }
+
+  List<String> _labelLines(_MapPoly p, Size ref) {
+    final out = <String>[p.label];
+
+    final can2 = ref.width >= 120 && ref.height >= 70;
+    final can3 = ref.width >= 140 && ref.height >= 95;
+
+    if (can2) {
+      out.add('${p.predicted}');
+    }
+    if (can3) {
+      out.add('${p.areaHa.toStringAsFixed(1)} ha');
+    }
+    return out;
+  }
+
+  double _labelOpacity(List<String> lines, Size ref, double zoom) {
+    if (lines.isEmpty) return 0.0;
+    final style = const TextStyle(
+      fontSize: 14,
+      fontWeight: FontWeight.w900,
+      height: 1.05,
+    );
+    final tp = TextPainter(
+      text: TextSpan(text: lines.join('\n'), style: style),
+      textAlign: TextAlign.center,
+      textDirection: TextDirection.ltr,
+      maxLines: lines.length,
+    )..layout();
+
+    final availW = math.max(1.0, ref.width * 0.80);
+    final availH = math.max(1.0, ref.height * 0.60);
+    final overflow = math.max(tp.width / availW, tp.height / availH);
+
+    var a = 1.0;
+    if (overflow > 1.0) {
+      a *= (1.0 / overflow).clamp(0.0, 1.0);
+    }
+    if (zoom < 13) {
+      a *= ((zoom - 11.5) / (13 - 11.5)).clamp(0.0, 1.0);
+    }
+    return a.clamp(0.0, 1.0);
+  }
+
+  Polyline _solidRing(List<ll.LatLng> ring) {
+    final pts = [...ring];
+    if (pts.length >= 2 && pts.first != pts.last) pts.add(pts.first);
+    return Polyline(
+      points: pts,
+      strokeWidth: 3.0,
+      color: Colors.orange.withValues(alpha: 0.95),
     );
   }
 
@@ -454,7 +1159,7 @@ class _HomeScreenState extends State<HomeScreen> {
         SizedBox(
           width: double.infinity,
           height: 64,
-          child: ElevatedButton(
+          child: FilledButton(
             onPressed: () async {
               await Navigator.of(
                 context,
@@ -462,7 +1167,7 @@ class _HomeScreenState extends State<HomeScreen> {
               await _refreshHome();
             },
             child: const Text(
-              'Start / Resume Recording',
+              'Start Recording Covers',
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
             ),
           ),
@@ -1429,6 +2134,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
     final isExcluded = !r.paddock.includeInRotation;
 
+    const minCoverBar = 1200;
+    const maxCoverBar = 3200;
+    final denom = (maxCoverBar - minCoverBar);
+    final cover = r.lastCover;
+    final clamped = cover == null
+        ? minCoverBar
+        : cover.clamp(minCoverBar, maxCoverBar);
+    final t = (cover == null || denom <= 0)
+        ? 0.0
+        : ((clamped - minCoverBar) / denom);
+
     // ✅ Prev line becomes "Excluded" when cropped
     final prevText = isExcluded
         ? 'Excluded'
@@ -1462,90 +2178,104 @@ class _HomeScreenState extends State<HomeScreen> {
           await _refreshHome();
         }
       },
-      child: Container(
-        color: bg,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        child: Row(
-          children: [
-            SizedBox(
-              width: cowColW,
-              child: Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // ✅ excluded red symbol (takes priority visually)
-                    if (isExcluded)
-                      const Icon(Icons.block, size: 16, color: Colors.red),
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: FractionallySizedBox(
+                widthFactor: t,
+                heightFactor: 1,
+                child: Container(color: Colors.green.withValues(alpha: 0.14)),
+              ),
+            ),
+          ),
+          Container(
+            color: bg,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: cowColW,
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // ✅ excluded red symbol (takes priority visually)
+                        if (isExcluded)
+                          const Icon(Icons.block, size: 16, color: Colors.red),
 
-                    // grazed symbol
-                    if (!isExcluded && r.grazed)
-                      const Text('🐄', style: TextStyle(fontSize: 16)),
+                        // grazed symbol
+                        if (!isExcluded && r.grazed)
+                          const Text('🐄', style: TextStyle(fontSize: 16)),
 
-                    // note symbol
-                    if (r.hasRecentNote)
-                      const Icon(Icons.sticky_note_2_outlined, size: 16),
+                        // note symbol
+                        if (r.hasRecentNote)
+                          const Icon(Icons.sticky_note_2_outlined, size: 16),
 
-                    if (isExcluded == false &&
-                        r.grazed == false &&
-                        r.hasRecentNote == false)
-                      const SizedBox(height: 16),
-                  ],
+                        if (isExcluded == false &&
+                            r.grazed == false &&
+                            r.hasRecentNote == false)
+                          const SizedBox(height: 16),
+                      ],
+                    ),
+                  ),
                 ),
-              ),
+                SizedBox(
+                  width: leftColW,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        r.paddock.name,
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: textColor,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        prevText,
+                        style: TextStyle(fontSize: 11, color: subColor),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          r.paddock.areaHa.toStringAsFixed(1),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 14, color: textColor),
+                        ),
+                      ),
+                      Expanded(
+                        child: Text(
+                          r.lastCover?.toString() ?? '—',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 14, color: textColor),
+                        ),
+                      ),
+                      Expanded(
+                        child: Text(
+                          r.predicted.toString(),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 14, color: textColor),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
-            SizedBox(
-              width: leftColW,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    r.paddock.name,
-                    style: TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
-                      color: textColor,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    prevText,
-                    style: TextStyle(fontSize: 11, color: subColor),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 6),
-            Expanded(
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      r.paddock.areaHa.toStringAsFixed(1),
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 14, color: textColor),
-                    ),
-                  ),
-                  Expanded(
-                    child: Text(
-                      r.lastCover?.toString() ?? '—',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 14, color: textColor),
-                    ),
-                  ),
-                  Expanded(
-                    child: Text(
-                      r.predicted.toString(),
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 14, color: textColor),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
