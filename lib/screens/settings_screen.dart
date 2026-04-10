@@ -9,6 +9,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../storage.dart';
 import 'instructions_screen.dart';
+import 'activity_log_screen.dart';
 import 'farm_map_import_screen.dart';
 import 'paddock_import_screen.dart';
 import 'paddock_ranking_screen.dart';
@@ -349,6 +350,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: const Text('Restore backup'),
             subtitle: const Text('Load data from a backup file'),
             onTap: _restore,
+          ),
+          ListTile(
+            leading: const Icon(Icons.history),
+            title: const Text('Activity log'),
+            subtitle: const Text(
+              'Grouped covers, grazings, and notes by day; select batches to delete',
+            ),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const ActivityLogScreen()),
+            ),
           ),
 
           const Divider(height: 32),

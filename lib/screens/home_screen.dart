@@ -139,6 +139,8 @@ class _MapPoly {
   final bool excluded;
   final int predicted;
   final bool pending;
+  /// At least one grazing with `at` in the future (scheduled).
+  final bool hasFutureGrazing;
   final List<List<ll.LatLng>> rings;
   final _MapBounds bounds;
   final ll.LatLng centroid;
@@ -150,6 +152,7 @@ class _MapPoly {
     required this.excluded,
     required this.predicted,
     required this.pending,
+    required this.hasFutureGrazing,
     required this.rings,
     required this.bounds,
     required this.centroid,
@@ -163,6 +166,8 @@ class _RowData {
   final int predicted; // predicted now (from latest anchor)
   final bool grazed; // last event is grazing
   final bool hasRecentNote; // note added today (used for home icon)
+  /// Any stored grazing for this paddock with `at` after now (scheduled).
+  final bool hasFutureGrazing;
 
   _RowData({
     required this.paddock,
@@ -171,6 +176,7 @@ class _RowData {
     required this.predicted,
     required this.grazed,
     required this.hasRecentNote,
+    required this.hasFutureGrazing,
   });
 }
 
@@ -216,6 +222,9 @@ class _HomeScreenState extends State<HomeScreen>
   final Set<String> _selectedSummaryNoteIds = {};
 
   int _tabIndex = 0;
+
+  /// Map is the last home tab; used for grazing multi-select layout (bar + map).
+  static const int _kMapTabIndex = 3;
 
   Future<List<_RowData>>? _rowsFuture;
 
@@ -268,6 +277,111 @@ class _HomeScreenState extends State<HomeScreen>
   Future<void> _refreshHome() async {
     await _load();
     if (mounted) setState(() {});
+  }
+
+  Future<DateTime?> _pickScheduleDateTime(DateTime initial) async {
+    final d = await showDatePicker(
+      context: context,
+      initialDate: DateTime(initial.year, initial.month, initial.day),
+      firstDate: DateTime(2000),
+      lastDate: DateTime(2100),
+    );
+    if (d == null || !mounted) return null;
+    final t = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(initial),
+    );
+    if (t == null || !mounted) return null;
+    return DateTime(d.year, d.month, d.day, t.hour, t.minute);
+  }
+
+  Future<void> _rescheduleUpcomingGrazing(Grazing g) async {
+    final next = await _pickScheduleDateTime(g.at);
+    if (next == null || !mounted) return;
+    final now = DateTime.now();
+    if (!next.isAfter(now)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Choose a date and time in the future.'),
+        ),
+      );
+      return;
+    }
+    await storage.updateGrazing(
+      Grazing(
+        id: g.id,
+        paddockId: g.paddockId,
+        at: next,
+        enteredAt: g.enteredAt,
+        preCover: g.preCover,
+        residual: g.residual,
+        harvestedKgDm: g.harvestedKgDm,
+      ),
+    );
+    if (!mounted) return;
+    await _refreshHome();
+  }
+
+  Future<void> _deleteSingleUpcomingGrazing(Grazing g) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete scheduled grazing?'),
+        content: const Text(
+          'Remove this scheduled event from the list? This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    await storage.deleteGrazingById(g.id);
+    if (!mounted) return;
+    await _refreshHome();
+  }
+
+  Future<void> _deleteAllUpcomingGrazings(int count) async {
+    if (count <= 0) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete all upcoming grazings?'),
+        content: Text(
+          'Remove all $count scheduled grazing event${count == 1 ? '' : 's'}? '
+          'This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              foregroundColor: Theme.of(ctx).colorScheme.onError,
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete all'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final removed = await storage.deleteAllGrazingsAfter(DateTime.now());
+    if (!mounted) return;
+    await _refreshHome();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Removed $removed scheduled event${removed == 1 ? '' : 's'}.')),
+    );
   }
 
   bool _sameDay(DateTime a, DateTime b) =>
@@ -382,6 +496,10 @@ class _HomeScreenState extends State<HomeScreen>
         predicted = clampCover(baseCover + (days * farmGrowth).round());
       }
 
+      final hasFutureGrazing = gsAll.any(
+        (g) => g.paddockId == p.id && g.at.isAfter(now),
+      );
+
       out.add(
         _RowData(
           paddock: p,
@@ -390,6 +508,7 @@ class _HomeScreenState extends State<HomeScreen>
           predicted: predicted,
           grazed: grazed,
           hasRecentNote: hasRecentNote,
+          hasFutureGrazing: hasFutureGrazing,
         ),
       );
     }
@@ -629,11 +748,12 @@ class _HomeScreenState extends State<HomeScreen>
                           children: [
                             _summaryTab(rows),
                             _paddocksTab(rows),
+                            _grazingsTab(rows),
                             _mapTab(rows),
                           ],
                         ),
                       ),
-                    if (selectionMode && _tabIndex == 2)
+                    if (selectionMode && _tabIndex == _kMapTabIndex)
                       Expanded(
                         child: LayoutBuilder(
                           builder: (context, constraints) {
@@ -669,7 +789,7 @@ class _HomeScreenState extends State<HomeScreen>
                           },
                         ),
                       ),
-                    if (selectionMode && _tabIndex != 2)
+                    if (selectionMode && _tabIndex != _kMapTabIndex)
                       Expanded(child: _paddocksTab(rows)),
                   ],
                 );
@@ -705,7 +825,8 @@ class _HomeScreenState extends State<HomeScreen>
               children: [
                 Expanded(child: _homeTabSegment(0, 'Summary')),
                 Expanded(child: _homeTabSegment(1, 'Paddocks')),
-                Expanded(child: _homeTabSegment(2, 'Map')),
+                Expanded(child: _homeTabSegment(2, 'Grazings')),
+                Expanded(child: _homeTabSegment(3, 'Map')),
               ],
             ),
           ),
@@ -736,7 +857,7 @@ class _HomeScreenState extends State<HomeScreen>
               duration: const Duration(milliseconds: 240),
               curve: Curves.easeOutCubic,
               alignment: Alignment.center,
-              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 10),
               decoration: BoxDecoration(
                 color: selected ? cs.primaryContainer : Colors.transparent,
                 borderRadius: BorderRadius.circular(14),
@@ -762,7 +883,7 @@ class _HomeScreenState extends State<HomeScreen>
                 overflow: TextOverflow.ellipsis,
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  fontSize: 13.5,
+                  fontSize: 12.5,
                   letterSpacing: 0.15,
                   fontWeight: selected ? FontWeight.w800 : FontWeight.w600,
                   color: selected
@@ -956,12 +1077,18 @@ class _HomeScreenState extends State<HomeScreen>
                           final sel =
                               selectionMode &&
                               selectedPaddockIds.contains(p.paddockId);
+                          final futureBorder =
+                              p.hasFutureGrazing && !p.excluded && !sel;
                           return Polygon(
                             points: p.rings.first,
                             borderColor: sel
                                 ? Colors.blue.shade700
-                                : Colors.black.withValues(alpha: 0.55),
-                            borderStrokeWidth: sel ? 3.2 : 1.6,
+                                : (futureBorder
+                                      ? Colors.blue.shade600
+                                      : Colors.black.withValues(alpha: 0.55)),
+                            borderStrokeWidth: sel
+                                ? 3.2
+                                : (futureBorder ? 2.8 : 1.6),
                             isFilled: true,
                             color: p.excluded
                                 ? Colors.grey.withValues(alpha: 0.25)
@@ -1029,6 +1156,54 @@ class _HomeScreenState extends State<HomeScreen>
                                         size: 16,
                                         color: Colors.black.withValues(
                                           alpha: 0.75,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }
+
+                            if (p.hasFutureGrazing &&
+                                !p.excluded &&
+                                show3) {
+                              out.add(
+                                Marker(
+                                  point: p.centroid,
+                                  width: 22,
+                                  height: 22,
+                                  alignment: Alignment.topLeft,
+                                  child: Transform.translate(
+                                    offset: const Offset(-18, -16),
+                                    child: Container(
+                                      width: 22,
+                                      height: 22,
+                                      decoration: BoxDecoration(
+                                        color: Colors.white.withValues(
+                                          alpha: 0.92,
+                                        ),
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(
+                                          color: Colors.blue.withValues(
+                                            alpha: 0.35,
+                                          ),
+                                        ),
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: Colors.black.withValues(
+                                              alpha: 0.10,
+                                            ),
+                                            blurRadius: 6,
+                                            offset: const Offset(0, 2),
+                                          ),
+                                        ],
+                                      ),
+                                      child: Text(
+                                        '🐄',
+                                        style: TextStyle(
+                                          fontSize: 15,
+                                          height: 1.0,
+                                          color: Colors.blue.shade800,
                                         ),
                                       ),
                                     ),
@@ -1217,6 +1392,7 @@ class _HomeScreenState extends State<HomeScreen>
           excluded: !row.paddock.includeInRotation,
           predicted: row.predicted,
           pending: pendingByPdk[paddockId] == true,
+          hasFutureGrazing: row.hasFutureGrazing,
           rings: rings,
           bounds: bounds,
           centroid: centroid,
@@ -1362,6 +1538,7 @@ class _HomeScreenState extends State<HomeScreen>
       color: Colors.orange.withValues(alpha: 0.95),
     );
   }
+
 
   Widget _summaryTab(List<_RowData> rows) {
     final included = rows.where((r) => r.paddock.includeInRotation).toList();
@@ -2301,6 +2478,395 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
+  /// All grazing events farm-wide: upcoming (soonest first), then past (newest first).
+  /// Tap a row to open that paddock’s history.
+  Widget _grazingsTab(List<_RowData> _) {
+    final nameById = {for (final p in paddocks) p.id: p.name};
+    final areaById = {for (final p in paddocks) p.id: p.areaHa};
+
+    return FutureBuilder<List<Grazing>>(
+      future: storage.loadAllGrazings(),
+      builder: (context, snap) {
+        if (!snap.hasData) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final now = DateTime.now();
+        final raw = snap.data!;
+        final upcoming = raw.where((g) => g.at.isAfter(now)).toList()
+          ..sort((a, b) => a.at.compareTo(b.at));
+        final past = raw.where((g) => !g.at.isAfter(now)).toList()
+          ..sort((a, b) => b.at.compareTo(a.at));
+        if (upcoming.isEmpty && past.isEmpty) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Text(
+                'No grazing events yet.',
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          );
+        }
+
+        final cs = Theme.of(context).colorScheme;
+        final listChildren = <Widget>[];
+
+        void addGrazingRows(List<Grazing> list, bool isUpcoming) {
+          for (var i = 0; i < list.length; i++) {
+            final g = list[i];
+            final name = nameById[g.paddockId] ?? g.paddockId;
+            final area = areaById[g.paddockId] ?? 0.0;
+            final harv = area > 0
+                ? (g.harvestedKgDm / area).toStringAsFixed(0)
+                : '—';
+            Paddock? pdk;
+            for (final p in paddocks) {
+              if (p.id == g.paddockId) {
+                pdk = p;
+                break;
+              }
+            }
+            listChildren.add(
+              _grazingsFarmRow(
+                context: context,
+                colorScheme: cs,
+                g: g,
+                paddockName: name,
+                harvestPerHaText: harv,
+                isUpcoming: isUpcoming,
+                onTap: pdk == null
+                    ? null
+                    : () async {
+                        await Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) =>
+                                PaddockHistoryScreen(paddock: pdk!),
+                          ),
+                        );
+                        await _refreshHome();
+                      },
+                onRescheduleUpcoming:
+                    isUpcoming ? () => _rescheduleUpcomingGrazing(g) : null,
+                onDeleteUpcoming:
+                    isUpcoming ? () => _deleteSingleUpcomingGrazing(g) : null,
+              ),
+            );
+            if (i < list.length - 1) {
+              listChildren.add(const Divider(height: 1));
+            }
+          }
+        }
+
+        if (upcoming.isNotEmpty) {
+          listChildren.add(
+            _grazingsSectionHeader(
+              context,
+              cs,
+              'Upcoming',
+              trailing: TextButton(
+                onPressed: () => _deleteAllUpcomingGrazings(upcoming.length),
+                style: TextButton.styleFrom(
+                  foregroundColor: Theme.of(context).colorScheme.error,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: const Text('Delete all'),
+              ),
+            ),
+          );
+          addGrazingRows(upcoming, true);
+        }
+        if (past.isNotEmpty) {
+          if (upcoming.isNotEmpty) {
+            listChildren.add(const Divider(height: 1));
+          }
+          listChildren.add(_grazingsSectionHeader(context, cs, 'Past'));
+          addGrazingRows(past, false);
+        }
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(
+              color: cs.surface,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 108,
+                    child: Text(
+                      'Date',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 12,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    flex: 2,
+                    child: Text(
+                      'Paddock',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 12,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 44,
+                    child: Text(
+                      'Pre',
+                      textAlign: TextAlign.end,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 11,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 44,
+                    child: Text(
+                      'Post',
+                      textAlign: TextAlign.end,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 11,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 48,
+                    child: Text(
+                      'Harv',
+                      textAlign: TextAlign.end,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 11,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 48),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: ListView(
+                padding: EdgeInsets.zero,
+                children: listChildren,
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _grazingsSectionHeader(
+    BuildContext context,
+    ColorScheme cs,
+    String title, {
+    Widget? trailing,
+  }) {
+    return Container(
+      width: double.infinity,
+      color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              title,
+              style: TextStyle(
+                fontWeight: FontWeight.w800,
+                fontSize: 12,
+                letterSpacing: 0.4,
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          ),
+          if (trailing != null) trailing,
+        ],
+      ),
+    );
+  }
+
+  Widget _grazingsFarmRow({
+    required BuildContext context,
+    required ColorScheme colorScheme,
+    required Grazing g,
+    required String paddockName,
+    required String harvestPerHaText,
+    required bool isUpcoming,
+    VoidCallback? onTap,
+    Future<void> Function()? onRescheduleUpcoming,
+    Future<void> Function()? onDeleteUpcoming,
+  }) {
+    final dateCol = SizedBox(
+      width: 108,
+      child: isUpcoming
+          ? Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  Icons.schedule,
+                  size: 16,
+                  color: colorScheme.tertiary,
+                ),
+                const SizedBox(width: 4),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        DateFormat('d MMM yyyy').format(g.at),
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      Text(
+                        'Scheduled',
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                              color: colorScheme.tertiary,
+                              fontWeight: FontWeight.w700,
+                            ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            )
+          : Text(
+              DateFormat('d MMM yyyy').format(g.at),
+              style: const TextStyle(fontSize: 13),
+            ),
+    );
+
+    final hasMenu =
+        isUpcoming && (onRescheduleUpcoming != null || onDeleteUpcoming != null);
+
+    final inner = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      child: Row(
+        children: [
+          dateCol,
+          Expanded(
+            child: InkWell(
+              onTap: onTap,
+              child: Row(
+                children: [
+                  Expanded(
+                    flex: 2,
+                    child: Text(
+                      paddockName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 44,
+                    child: Text(
+                      '${g.preCover}',
+                      textAlign: TextAlign.end,
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 44,
+                    child: Text(
+                      '${g.residual}',
+                      textAlign: TextAlign.end,
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 48,
+                    child: Text(
+                      harvestPerHaText,
+                      textAlign: TextAlign.end,
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (hasMenu)
+            PopupMenuButton<String>(
+              padding: EdgeInsets.zero,
+              icon: Icon(
+                Icons.more_vert,
+                size: 22,
+                color: colorScheme.onSurfaceVariant,
+              ),
+              onSelected: (v) async {
+                if (v == 'r') await onRescheduleUpcoming?.call();
+                if (v == 'd') await onDeleteUpcoming?.call();
+              },
+              itemBuilder: (ctx) => [
+                const PopupMenuItem(
+                  value: 'r',
+                  child: ListTile(
+                    dense: true,
+                    leading: Icon(Icons.event_repeat_outlined),
+                    title: Text('Reschedule'),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+                PopupMenuItem(
+                  value: 'd',
+                  child: ListTile(
+                    dense: true,
+                    leading: Icon(
+                      Icons.delete_outline,
+                      color: Theme.of(ctx).colorScheme.error,
+                    ),
+                    title: Text(
+                      'Delete',
+                      style: TextStyle(color: Theme.of(ctx).colorScheme.error),
+                    ),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+              ],
+            )
+          else
+            const SizedBox(width: 48),
+        ],
+      ),
+    );
+
+    final decorated = isUpcoming
+        ? DecoratedBox(
+            decoration: BoxDecoration(
+              color: colorScheme.tertiaryContainer.withValues(alpha: 0.45),
+              border: Border(
+                left: BorderSide(color: colorScheme.tertiary, width: 3),
+              ),
+            ),
+            child: inner,
+          )
+        : inner;
+
+    return Material(
+      color: Colors.transparent,
+      child: decorated,
+    );
+  }
+
   Widget _stickyHeader() {
     return Container(
       color: Colors.white,
@@ -2455,13 +3021,24 @@ class _HomeScreenState extends State<HomeScreen>
                         if (!isExcluded && r.grazed)
                           const Text('🐄', style: TextStyle(fontSize: 16)),
 
+                        // scheduled (future) grazing — blue cow vs unstyled 🐄 for recently grazed
+                        if (!isExcluded && r.hasFutureGrazing)
+                          Text(
+                            '🐄',
+                            style: TextStyle(
+                              fontSize: 16,
+                              color: Colors.blue.shade700,
+                            ),
+                          ),
+
                         // note symbol
                         if (r.hasRecentNote)
                           const Icon(Icons.sticky_note_2_outlined, size: 16),
 
                         if (isExcluded == false &&
                             r.grazed == false &&
-                            r.hasRecentNote == false)
+                            r.hasRecentNote == false &&
+                            r.hasFutureGrazing == false)
                           const SizedBox(height: 16),
                       ],
                     ),

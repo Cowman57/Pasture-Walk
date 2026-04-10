@@ -374,6 +374,21 @@ class Storage {
     final _ = prev;
   }
 
+  Future<void> deleteMeasurementById(String id) async {
+    final all = await _loadMeasurements();
+    final before = all.length;
+    all.removeWhere((m) => m.id == id);
+    if (all.length < before) await _saveMeasurements(all);
+  }
+
+  Future<void> updateMeasurement(Measurement m) async {
+    final all = await _loadMeasurements();
+    final i = all.indexWhere((x) => x.id == m.id);
+    if (i < 0) return;
+    all[i] = m;
+    await _saveMeasurements(all);
+  }
+
   // -----------------------------
   // NOTES
   // -----------------------------
@@ -397,6 +412,23 @@ class Storage {
     final all = await _loadNotes();
     all.add(n);
     await _saveNotes(all);
+  }
+
+  Future<void> updateNote(NoteEntry n) async {
+    final all = await _loadNotes();
+    final i = all.indexWhere((x) => x.id == n.id);
+    if (i < 0) return;
+    all[i] = n;
+    await _saveNotes(all);
+  }
+
+  Future<void> deleteNoteById(String id) async {
+    final all = await _loadNotes();
+    final before = all.length;
+    all.removeWhere((x) => x.id == id);
+    if (all.length >= before) return;
+    await _saveNotes(all);
+    await unhideSummaryNoteId(id);
   }
 
   Future<Set<String>> loadHiddenSummaryNoteIds() async {
@@ -442,17 +474,46 @@ class Storage {
     return list.map((e) => Grazing.fromMap(e)).toList();
   }
 
+  Future<void> _saveGrazings(List<Grazing> all) async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setString(
+      _grazingsKey,
+      jsonEncode(all.map((x) => x.toMap()).toList()),
+    );
+  }
+
   /// KPIs helper: raw load all
   Future<List<Grazing>> loadAllGrazings() async => _loadGrazings();
 
   Future<void> appendGrazing(Grazing g) async {
     final all = await _loadGrazings();
     all.add(g);
-    final sp = await SharedPreferences.getInstance();
-    await sp.setString(
-      _grazingsKey,
-      jsonEncode(all.map((x) => x.toMap()).toList()),
-    );
+    await _saveGrazings(all);
+  }
+
+  Future<void> deleteGrazingById(String id) async {
+    final all = await _loadGrazings();
+    final before = all.length;
+    all.removeWhere((g) => g.id == id);
+    if (all.length < before) await _saveGrazings(all);
+  }
+
+  /// Removes every grazing whose event time is after [asOf] (scheduled / future).
+  /// Returns how many records were removed.
+  Future<int> deleteAllGrazingsAfter(DateTime asOf) async {
+    final all = await _loadGrazings();
+    final before = all.length;
+    all.removeWhere((g) => g.at.isAfter(asOf));
+    if (all.length < before) await _saveGrazings(all);
+    return before - all.length;
+  }
+
+  Future<void> updateGrazing(Grazing g) async {
+    final all = await _loadGrazings();
+    final i = all.indexWhere((x) => x.id == g.id);
+    if (i < 0) return;
+    all[i] = g;
+    await _saveGrazings(all);
   }
 
   Future<Grazing?> _lastGrazingForPaddockAsOf(
@@ -485,11 +546,7 @@ class Storage {
       (g) => paddockIds.contains(g.paddockId) && g.at.isAfter(cutoff),
     );
 
-    final sp = await SharedPreferences.getInstance();
-    await sp.setString(
-      _grazingsKey,
-      jsonEncode(all.map((x) => x.toMap()).toList()),
-    );
+    await _saveGrazings(all);
 
     return before - all.length;
   }
@@ -691,11 +748,7 @@ class Storage {
     }
 
     final filtered = grazings.where((g) => !toDelete.contains(g.id)).toList();
-    final sp = await SharedPreferences.getInstance();
-    await sp.setString(
-      _grazingsKey,
-      jsonEncode(filtered.map((x) => x.toMap()).toList()),
-    );
+    await _saveGrazings(filtered);
 
     return DuplicateGrazingCleanupSummary(
       deletedGrazings: toDelete.length,

@@ -103,6 +103,7 @@ class _GrazingSchedulePreviewScreenState
     final items = _buildSchedule();
     final res = clampCover(widget.residualKgDmHa);
     final farmGrowth = await storage.effectiveFarmGrowthKgDmPerHaPerDay();
+    final enteredAt = DateTime.now();
 
     for (final it in items) {
       final when = _day(it.day);
@@ -126,6 +127,7 @@ class _GrazingSchedulePreviewScreenState
         id: uuid.v4(),
         paddockId: it.paddockId,
         at: when,
+        enteredAt: enteredAt,
         preCover: pre,
         residual: res,
         harvestedKgDm: harvestedKgDm,
