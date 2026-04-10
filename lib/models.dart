@@ -69,6 +69,8 @@ class Grazing {
   final String id;
   final String paddockId;
   final DateTime at;
+  /// When this record was saved (used to group scheduled/future grazings by entry day).
+  final DateTime enteredAt;
   final int preCover;
   final int residual;
   final int harvestedKgDm;
@@ -77,28 +79,38 @@ class Grazing {
     required this.id,
     required this.paddockId,
     required this.at,
+    DateTime? enteredAt,
     required this.preCover,
     required this.residual,
     required this.harvestedKgDm,
-  });
+  }) : enteredAt = enteredAt ?? at;
 
   Map<String, dynamic> toMap() => {
     'id': id,
     'paddockId': paddockId,
     'at': at.toIso8601String(),
+    'enteredAt': enteredAt.toIso8601String(),
     'preCover': preCover,
     'residual': residual,
     'harvestedKgDm': harvestedKgDm,
   };
 
-  static Grazing fromMap(Map<String, dynamic> m) => Grazing(
-    id: m['id'],
-    paddockId: m['paddockId'],
-    at: DateTime.parse(m['at']),
-    preCover: m['preCover'],
-    residual: m['residual'],
-    harvestedKgDm: m['harvestedKgDm'],
-  );
+  static Grazing fromMap(Map<String, dynamic> m) {
+    final at = DateTime.parse(m['at']);
+    final enteredRaw = m['enteredAt'];
+    final enteredAt = enteredRaw != null
+        ? DateTime.parse(enteredRaw as String)
+        : at;
+    return Grazing(
+      id: m['id'],
+      paddockId: m['paddockId'],
+      at: at,
+      enteredAt: enteredAt,
+      preCover: m['preCover'],
+      residual: m['residual'],
+      harvestedKgDm: m['harvestedKgDm'],
+    );
+  }
 }
 
 class NoteEntry {

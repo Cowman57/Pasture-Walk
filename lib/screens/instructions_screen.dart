@@ -38,7 +38,7 @@ class InstructionsScreen extends StatelessWidget {
             'Finish saves the current paddock and returns to Home.',
           ]),
 
-          _H1('3) Home screen (Summary + Paddocks tabs)'),
+          _H1('3) Home screen (Summary, Paddocks, Grazings, Map)'),
           _H2('Summary tab'),
           _Bullets([
             'Shows farm KPIs, the feed wedge, and recent notes.',
@@ -50,6 +50,20 @@ class InstructionsScreen extends StatelessWidget {
             'Shows paddocks with Area, last Recorded cover, and Predicted cover for today.',
             'Tap a paddock to open its History (Covers / Grazings / Notes).',
             'Long-press paddocks to enter selection mode (used for grazing entry).',
+            '🐄 = recently grazed; blue 🐄 = at least one scheduled (future-dated) grazing for that paddock.',
+          ]),
+          _H2('Grazings tab'),
+          _Bullets([
+            'Lists farm-wide grazings in two sections: Upcoming (soonest first) and Past (newest first).',
+            'Future-dated (scheduled) grazings show a Scheduled label and tinted row so they stand out from past events.',
+            'Tap a row to open that paddock’s history. Use ⋮ on an upcoming row to reschedule or delete that scheduled event; use Delete all on the Upcoming header to clear every future grazing at once.',
+          ]),
+          _H2('Map tab'),
+          _Bullets([
+            'Import a farm map (GeoJSON or Shapefile zip) from Settings to show paddock outlines.',
+            'Colours reflect predicted cover; tap a paddock for history, long-press to enter grazing selection.',
+            'Scheduled (future) grazings use a stronger blue outline on the paddock; when zoomed in enough, a small cow marker appears on the label.',
+            'Use the floating button to switch between satellite imagery and street map.',
           ]),
 
           _H1('4) Paddock history + notes'),
@@ -57,6 +71,7 @@ class InstructionsScreen extends StatelessWidget {
             'Covers tab: all recorded covers over time.',
             'Grazings tab: grazing events (pre, residual, harvested).',
             'Notes tab: notes you add during recording (e.g. weeds, leaks).',
+            'Use ⋮ on each row to edit or delete a single cover, grazing, or note.',
           ]),
           _H2('Notes buttons'),
           _P(
@@ -79,6 +94,11 @@ class InstructionsScreen extends StatelessWidget {
             'Backup saves everything (paddocks, order, settings, covers, grazings, notes) to a .json file.',
             'Restore overwrites the current device’s data with the backup file.',
             'Keep backups somewhere safe (Drive, USB, etc.).',
+          ]),
+          _H2('Activity log (Settings)'),
+          _Bullets([
+            'Shows covers, grazings, and notes grouped by calendar day and type (e.g. one row for all pasture covers on a day, with event and paddock counts).',
+            'Press and hold a group to select it for deletion; use the checkboxes to add more groups, then Delete. Expand a group to delete individual events with the trash icon.',
           ]),
 
           _H1('Tips'),
