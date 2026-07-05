@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 
+import '../models.dart';
 import '../storage.dart';
+import '../utils.dart';
 
 class AvgCoverHistoryScreen extends StatefulWidget {
   const AvgCoverHistoryScreen({super.key});
@@ -15,6 +17,18 @@ class _DayPoint {
   final double avg;
 
   _DayPoint(this.day, this.avg);
+}
+
+class _ChartMarker {
+  final double value;
+  final String tapLabel;
+  final Color color;
+
+  const _ChartMarker({
+    required this.value,
+    required this.tapLabel,
+    required this.color,
+  });
 }
 
 class _AvgCoverHistoryScreenState extends State<AvgCoverHistoryScreen> {
@@ -117,6 +131,67 @@ class _AvgCoverHistoryScreenState extends State<AvgCoverHistoryScreen> {
     }
 
     return out;
+  }
+
+  Future<int?> _loadPredictedCover() async {
+    final now = DateTime.now();
+    final paddocks = await storage.loadPaddocks();
+    final included = paddocks.where((p) => p.includeInRotation).toList();
+    if (included.isEmpty) return null;
+
+    final manualGrowth = await storage.loadManualFarmGrowthKgDmPerHaPerDay();
+    final batch = await Future.wait([
+      storage.loadAllMeasurements(),
+      storage.loadAllGrazings(),
+    ]);
+    final msAll = batch[0] as List<Measurement>;
+    final gsAll = batch[1] as List<Grazing>;
+    final includedIds = included.map((p) => p.id).toSet();
+    final farmGrowth = manualGrowth ??
+        storage.computeFarmGrowthFromLoadedData(msAll, gsAll, includedIds);
+
+    final msByPdk = <String, List<Measurement>>{};
+    for (final m in msAll) {
+      (msByPdk[m.paddockId] ??= []).add(m);
+    }
+    for (final list in msByPdk.values) {
+      list.sort((a, b) => b.at.compareTo(a.at));
+    }
+
+    final lastGrazingByPdk = <String, Grazing?>{};
+    for (final g in gsAll) {
+      if (g.at.isAfter(now)) continue;
+      final cur = lastGrazingByPdk[g.paddockId];
+      if (cur == null || g.at.isAfter(cur.at)) {
+        lastGrazingByPdk[g.paddockId] = g;
+      }
+    }
+
+    final predicted = <int>[];
+    for (final p in included) {
+      final lastM = msByPdk[p.id]?.firstOrNull;
+      final lastG = lastGrazingByPdk[p.id];
+      final baseAt = (lastM == null && lastG == null)
+          ? null
+          : (lastM != null && lastG == null)
+          ? lastM.at
+          : (lastG != null && lastM == null)
+          ? lastG.at
+          : (lastM!.at.isAfter(lastG!.at) ? lastM.at : lastG.at);
+      final baseCover = (lastM == null && lastG == null)
+          ? 2500
+          : (lastM != null && lastG == null)
+          ? lastM.cover
+          : (lastG != null && lastM == null)
+          ? lastG.residual
+          : (lastM!.at.isAfter(lastG!.at) ? lastM.cover : lastG.residual);
+      final days = baseAt == null ? 0 : now.difference(baseAt).inDays;
+      predicted.add(clampCover(baseCover + (days * farmGrowth).round()));
+    }
+
+    final vals = predicted.where((v) => v > 0).toList();
+    if (vals.isEmpty) return null;
+    return (vals.reduce((a, b) => a + b) / vals.length).round();
   }
 
   Future<List<_DayPoint>> _loadGrowthSeries(DateTimeRange range) async {
@@ -254,26 +329,40 @@ class _AvgCoverHistoryScreenState extends State<AvgCoverHistoryScreen> {
           const SizedBox(height: 10),
           SizedBox(
             height: 260,
-            child: FutureBuilder<List<_DayPoint>>(
-              future: _loadSeries(range),
+            child: FutureBuilder<List<dynamic>>(
+              future: Future.wait([
+                _loadSeries(range),
+                _loadPredictedCover(),
+              ]),
               builder: (context, snap) {
                 if (!snap.hasData) {
                   return const Center(child: CircularProgressIndicator());
                 }
 
-                final pts = snap.data ?? <_DayPoint>[];
-                if (pts.length < 2) {
+                final pts = snap.data![0] as List<_DayPoint>;
+                final predicted = snap.data![1] as int?;
+                final markers = predicted == null
+                    ? const <_ChartMarker>[]
+                    : [
+                        _ChartMarker(
+                          value: predicted.toDouble(),
+                          tapLabel: 'Predicted $predicted',
+                          color: const Color(0xFFE67E22),
+                        ),
+                      ];
+
+                if (pts.length < 2 && markers.isEmpty) {
                   return const Center(
                     child: Text('Not enough recorded cover data in range.'),
                   );
                 }
 
-                final minY = pts
-                    .map((p) => p.avg)
-                    .reduce((a, b) => a < b ? a : b);
-                final maxY = pts
-                    .map((p) => p.avg)
-                    .reduce((a, b) => a > b ? a : b);
+                final allY = [
+                  ...pts.map((p) => p.avg),
+                  ...markers.map((m) => m.value),
+                ];
+                final minY = allY.reduce((a, b) => a < b ? a : b);
+                final maxY = allY.reduce((a, b) => a > b ? a : b);
 
                 return _LineChart(
                   title: 'Average cover (recorded)',
@@ -282,6 +371,7 @@ class _AvgCoverHistoryScreenState extends State<AvgCoverHistoryScreen> {
                   points: pts,
                   minY: minY,
                   maxY: maxY,
+                  markers: markers,
                 );
               },
             ),
@@ -334,6 +424,7 @@ class _LineChart extends StatefulWidget {
   final List<_DayPoint> points;
   final double minY;
   final double maxY;
+  final List<_ChartMarker> markers;
 
   const _LineChart({
     required this.title,
@@ -342,6 +433,7 @@ class _LineChart extends StatefulWidget {
     required this.points,
     required this.minY,
     required this.maxY,
+    this.markers = const [],
   });
 
   @override
@@ -349,7 +441,45 @@ class _LineChart extends StatefulWidget {
 }
 
 class _LineChartState extends State<_LineChart> {
+  static const double _leftPad = 44.0;
+  static const double _topPad = 26.0;
+  static const double _rightPad = 12.0;
+  static const double _bottomPad = 34.0;
+
   int? selected;
+  int? selectedMarker;
+
+  double _floorTo(double v, double step) {
+    if (step <= 0) return v;
+    return (v / step).floorToDouble() * step;
+  }
+
+  double _ceilTo(double v, double step) {
+    if (step <= 0) return v;
+    return (v / step).ceilToDouble() * step;
+  }
+
+  Rect _plotRect(Size size) {
+    return Rect.fromLTWH(
+      _leftPad,
+      _topPad,
+      size.width - _leftPad - _rightPad,
+      size.height - _topPad - _bottomPad,
+    );
+  }
+
+  Offset? _markerPosition(Size size) {
+    if (widget.markers.isEmpty) return null;
+    final plot = _plotRect(size);
+    final safeStep = widget.yStep <= 0 ? 1.0 : widget.yStep;
+    final yMin = _floorTo(widget.minY, safeStep);
+    final yMax = _ceilTo(widget.maxY, safeStep);
+    final ySpan = (yMax - yMin).abs() < 1 ? 1.0 : (yMax - yMin);
+    final value = widget.markers.first.value;
+    final yFrac = (value - yMin) / ySpan;
+    final y = plot.bottom - yFrac * plot.height;
+    return Offset(plot.right - 8, y);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -357,17 +487,40 @@ class _LineChartState extends State<_LineChart> {
       builder: (context, c) {
         final w = c.maxWidth;
         final h = c.maxHeight;
+        final size = Size(w, h);
 
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTapDown: (d) {
+            final markerPos = _markerPosition(size);
+            if (markerPos != null) {
+              final dist = (d.localPosition - markerPos).distance;
+              if (dist < 24) {
+                setState(() {
+                  selectedMarker = 0;
+                  selected = null;
+                });
+                return;
+              }
+            }
+
             final n = widget.points.length;
-            final plotLeft = 12.0;
-            final plotRight = w - 12.0;
-            final x = d.localPosition.dx.clamp(plotLeft, plotRight);
-            final frac = (x - plotLeft) / (plotRight - plotLeft);
+            if (n < 2) {
+              setState(() {
+                selected = null;
+                selectedMarker = null;
+              });
+              return;
+            }
+
+            final plot = _plotRect(size);
+            final x = d.localPosition.dx.clamp(plot.left, plot.right);
+            final frac = (x - plot.left) / plot.width;
             final idx = (frac * (n - 1)).round().clamp(0, n - 1);
-            setState(() => selected = idx);
+            setState(() {
+              selected = idx;
+              selectedMarker = null;
+            });
           },
           child: CustomPaint(
             painter: _LineChartPainter(
@@ -378,8 +531,10 @@ class _LineChartState extends State<_LineChart> {
               minY: widget.minY,
               maxY: widget.maxY,
               selectedIndex: selected,
+              selectedMarkerIndex: selectedMarker,
+              markers: widget.markers,
             ),
-            size: Size(w, h),
+            size: size,
           ),
         );
       },
@@ -395,6 +550,8 @@ class _LineChartPainter extends CustomPainter {
   final double minY;
   final double maxY;
   final int? selectedIndex;
+  final int? selectedMarkerIndex;
+  final List<_ChartMarker> markers;
 
   _LineChartPainter({
     required this.title,
@@ -404,6 +561,8 @@ class _LineChartPainter extends CustomPainter {
     required this.minY,
     required this.maxY,
     required this.selectedIndex,
+    this.selectedMarkerIndex,
+    this.markers = const [],
   });
 
   DateTime _day(DateTime d) => DateTime(d.year, d.month, d.day);
@@ -499,26 +658,38 @@ class _LineChartPainter extends CustomPainter {
       ..strokeWidth = 1;
     canvas.drawRect(plot, axis);
 
-    if (points.length < 2) return;
-
     final safeStep = yStep <= 0 ? 1.0 : yStep;
     final yMin = _floorTo(minY, safeStep);
     final yMax = _ceilTo(maxY, safeStep);
     final ySpan = (yMax - yMin).abs() < 1 ? 1.0 : (yMax - yMin);
 
-    final firstDay = _day(points.first.day);
-    final lastDay = _day(points.last.day);
+    if (points.isEmpty && markers.isEmpty) return;
+
+    final firstDay = points.isNotEmpty
+        ? _day(points.first.day)
+        : _day(DateTime.now()).subtract(const Duration(days: 7));
+    final lastDay = points.isNotEmpty
+        ? _day(points.last.day)
+        : _day(DateTime.now());
     final spanDays = lastDay.difference(firstDay).inDays;
     final xSpanDays = spanDays <= 0 ? 1 : spanDays;
 
-    Offset pt(int i) {
-      final d = _day(points[i].day);
+    Offset ptForDay(DateTime day, double value) {
+      final d = _day(day);
       final xFrac = d.difference(firstDay).inDays / xSpanDays;
-      final yFrac = (points[i].avg - yMin) / ySpan;
+      final yFrac = (value - yMin) / ySpan;
       final x = plot.left + xFrac * plot.width;
       final y = plot.bottom - yFrac * plot.height;
       return Offset(x, y);
     }
+
+    Offset ptForMarker(double value) {
+      final yFrac = (value - yMin) / ySpan;
+      final y = plot.bottom - yFrac * plot.height;
+      return Offset(plot.right - 8, y);
+    }
+
+    Offset pt(int i) => ptForDay(points[i].day, points[i].avg);
 
     final grid = Paint()
       ..color = const Color(0x14000000)
@@ -567,61 +738,28 @@ class _LineChartPainter extends CustomPainter {
       tp.paint(canvas, Offset(x, plot.bottom + 6));
     }
 
-    final line = Paint()
-      ..color = const Color(0xFF2F66E3)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2;
+    if (points.length >= 2) {
+      final line = Paint()
+        ..color = const Color(0xFF2F66E3)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2;
 
-    final offsets = <Offset>[];
-    for (int i = 0; i < points.length; i++) {
-      offsets.add(pt(i));
+      final offsets = <Offset>[];
+      for (int i = 0; i < points.length; i++) {
+        offsets.add(pt(i));
+      }
+
+      final smooth = _smoothPath(offsets);
+      canvas.drawPath(smooth, line);
+
+      final dot = Paint()..color = const Color(0xFF2F66E3);
+      for (int i = 0; i < points.length; i++) {
+        final p = pt(i);
+        canvas.drawCircle(p, 2.5, dot);
+      }
     }
 
-    final smooth = _smoothPath(offsets);
-    canvas.drawPath(smooth, line);
-
-    final dot = Paint()..color = const Color(0xFF2F66E3);
-    for (int i = 0; i < points.length; i++) {
-      final p = pt(i);
-      canvas.drawCircle(p, 2.5, dot);
-    }
-
-    // Title + axes context
-    _drawText(
-      canvas,
-      title,
-      const Offset(12, 4),
-      weight: FontWeight.w900,
-      size: 13,
-      color: const Color(0xDD000000),
-    );
-    _drawText(
-      canvas,
-      unit,
-      Offset(12, topPad + 2),
-      weight: FontWeight.w800,
-      size: 10,
-      color: const Color(0x88000000),
-    );
-
-    // (y labels + grid + x labels drawn above)
-
-    if (selectedIndex != null) {
-      final i = selectedIndex!.clamp(0, points.length - 1);
-      final p = pt(i);
-
-      final cross = Paint()
-        ..color = const Color(0x552F66E3)
-        ..strokeWidth = 1;
-      canvas.drawLine(Offset(p.dx, plot.top), Offset(p.dx, plot.bottom), cross);
-
-      final sel = Paint()..color = const Color(0xFF2F66E3);
-      canvas.drawCircle(p, 5, sel);
-
-      final fmt = DateFormat('d MMM');
-      final label =
-          '${fmt.format(points[i].day)}  ${points[i].avg.toStringAsFixed(1)}';
-
+    void drawValueBubble(Offset p, String label, Color color) {
       final tp = TextPainter(
         text: TextSpan(
           text: label,
@@ -658,6 +796,52 @@ class _LineChartPainter extends CustomPainter {
 
       tp.paint(canvas, Offset(bubble.left + bubblePad, bubble.top + bubblePad));
     }
+
+    for (var i = 0; i < markers.length; i++) {
+      final marker = markers[i];
+      final p = ptForMarker(marker.value);
+      final dot = Paint()..color = marker.color;
+      canvas.drawCircle(p, selectedMarkerIndex == i ? 5 : 4, dot);
+      if (selectedMarkerIndex == i) {
+        drawValueBubble(p, marker.tapLabel, marker.color);
+      }
+    }
+
+    // Title + axes context
+    _drawText(
+      canvas,
+      title,
+      const Offset(12, 4),
+      weight: FontWeight.w900,
+      size: 13,
+      color: const Color(0xDD000000),
+    );
+    _drawText(
+      canvas,
+      unit,
+      Offset(12, topPad + 2),
+      weight: FontWeight.w800,
+      size: 10,
+      color: const Color(0x88000000),
+    );
+
+    if (selectedIndex != null && points.length >= 2) {
+      final i = selectedIndex!.clamp(0, points.length - 1);
+      final p = pt(i);
+
+      final cross = Paint()
+        ..color = const Color(0x552F66E3)
+        ..strokeWidth = 1;
+      canvas.drawLine(Offset(p.dx, plot.top), Offset(p.dx, plot.bottom), cross);
+
+      final sel = Paint()..color = const Color(0xFF2F66E3);
+      canvas.drawCircle(p, 5, sel);
+
+      final fmt = DateFormat('d MMM');
+      final label =
+          '${fmt.format(points[i].day)}  ${points[i].avg.toStringAsFixed(1)}';
+      drawValueBubble(p, label, const Color(0xFF2F66E3));
+    }
   }
 
   @override
@@ -668,6 +852,8 @@ class _LineChartPainter extends CustomPainter {
         oldDelegate.points != points ||
         oldDelegate.minY != minY ||
         oldDelegate.maxY != maxY ||
-        oldDelegate.selectedIndex != selectedIndex;
+        oldDelegate.selectedIndex != selectedIndex ||
+        oldDelegate.selectedMarkerIndex != selectedMarkerIndex ||
+        oldDelegate.markers != markers;
   }
 }

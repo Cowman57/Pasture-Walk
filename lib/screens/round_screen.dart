@@ -78,6 +78,9 @@ class _RoundScreenState extends State<RoundScreen>
   // Last recorded measurement per paddock (latest, any date)
   final Map<String, Measurement?> lastMeasured = {};
 
+  // Last cover shown in UI: latest measurement before today (not overwritten this session)
+  final Map<String, Measurement?> lastCoverBeforeToday = {};
+
   // ✅ Draft (current-session) cover per paddock, so values "stick" when you go back/forth
   final Map<String, int> draftCover = {};
 
@@ -292,6 +295,11 @@ class _RoundScreenState extends State<RoundScreen>
     for (final p in order) {
       final lm = Storage.latestMeasurementFromList(allMeasurements, p.id);
       lastMeasured[p.id] = lm;
+      lastCoverBeforeToday[p.id] = Storage.latestMeasurementBeforeDay(
+        allMeasurements,
+        p.id,
+        now,
+      );
 
       final anchor = Storage.latestAnchorFromLists(
         allMeasurements,
@@ -711,7 +719,7 @@ class _RoundScreenState extends State<RoundScreen>
 
   Paddock get _p => order[idx];
   int get _pred => predictedNow[_p.id] ?? 2500;
-  Measurement? get _last => lastMeasured[_p.id];
+  Measurement? get _last => lastCoverBeforeToday[_p.id];
   double get _gEff => farmGrowth;
 
   Future<void> _appendNote(String title) async {

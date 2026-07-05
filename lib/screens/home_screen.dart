@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 import 'package:uuid/uuid.dart';
 import 'dart:math' as math;
@@ -214,10 +215,14 @@ class _HomeScreenState extends State<HomeScreen>
   static const String colRecorded = 'recorded';
   static const String colPredicted = 'predictedNow';
 
-  // Selection mode for grazing
+  // Selection mode for grazing entry (paddocks / map)
   bool selectionMode = false;
   final Set<String> selectedPaddockIds = {};
   int residual = 1600;
+
+  // Selection mode for deleting grazings from the Grazings tab
+  bool _grazingListSelectionMode = false;
+  final Set<String> _selectedGrazingIds = {};
 
   final Set<String> _selectedSummaryNoteIds = {};
 
@@ -346,6 +351,79 @@ class _HomeScreenState extends State<HomeScreen>
     await storage.deleteGrazingById(g.id);
     if (!mounted) return;
     await _refreshHome();
+  }
+
+  void _enterGrazingListSelectionMode(String grazingId) {
+    HapticFeedback.mediumImpact();
+    setState(() {
+      _grazingListSelectionMode = true;
+      _selectedGrazingIds.add(grazingId);
+    });
+  }
+
+  void _toggleGrazingListSelection(String grazingId) {
+    setState(() {
+      if (_selectedGrazingIds.contains(grazingId)) {
+        _selectedGrazingIds.remove(grazingId);
+        if (_selectedGrazingIds.isEmpty) {
+          _grazingListSelectionMode = false;
+        }
+      } else {
+        _selectedGrazingIds.add(grazingId);
+      }
+    });
+  }
+
+  void _cancelGrazingListSelection() {
+    setState(() {
+      _grazingListSelectionMode = false;
+      _selectedGrazingIds.clear();
+    });
+  }
+
+  Future<void> _deleteSelectedGrazings() async {
+    if (_selectedGrazingIds.isEmpty) return;
+    final count = _selectedGrazingIds.length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete selected grazings?'),
+        content: Text(
+          'Remove $count grazing event${count == 1 ? '' : 's'}? '
+          'This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              foregroundColor: Theme.of(ctx).colorScheme.onError,
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    for (final id in _selectedGrazingIds) {
+      await storage.deleteGrazingById(id);
+    }
+    if (!mounted) return;
+    setState(() {
+      _grazingListSelectionMode = false;
+      _selectedGrazingIds.clear();
+    });
+    await _refreshHome();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Removed $count grazing event${count == 1 ? '' : 's'}.'),
+      ),
+    );
   }
 
   Future<void> _deleteAllUpcomingGrazings(int count) async {
@@ -705,15 +783,40 @@ class _HomeScreenState extends State<HomeScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(selectionMode ? 'Select paddocks' : 'Pasture Walk'),
+        title: Text(
+          selectionMode
+              ? 'Select paddocks'
+              : _grazingListSelectionMode
+              ? 'Select grazings'
+              : 'Pasture Walk',
+        ),
         leading: selectionMode
             ? IconButton(
                 icon: const Icon(Icons.close),
                 onPressed: _cancelSelection,
               )
+            : _grazingListSelectionMode
+            ? IconButton(
+                icon: const Icon(Icons.close),
+                onPressed: _cancelGrazingListSelection,
+              )
             : null,
         actions: [
-          if (!selectionMode)
+          if (_grazingListSelectionMode)
+            TextButton(
+              onPressed: _selectedGrazingIds.isEmpty
+                  ? null
+                  : _deleteSelectedGrazings,
+              child: Text(
+                'Delete (${_selectedGrazingIds.length})',
+                style: TextStyle(
+                  color: _selectedGrazingIds.isEmpty
+                      ? Theme.of(context).disabledColor
+                      : Theme.of(context).colorScheme.error,
+                ),
+              ),
+            ),
+          if (!selectionMode && !_grazingListSelectionMode)
             IconButton(
               icon: const Icon(Icons.settings),
               onPressed: () async {
@@ -845,7 +948,15 @@ class _HomeScreenState extends State<HomeScreen>
         borderRadius: BorderRadius.circular(14),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: () => setState(() => _tabIndex = index),
+          onTap: () {
+            setState(() {
+              if (index != 2) {
+                _grazingListSelectionMode = false;
+                _selectedGrazingIds.clear();
+              }
+              _tabIndex = index;
+            });
+          },
           borderRadius: BorderRadius.circular(14),
           splashColor: cs.primary.withValues(alpha: 0.12),
           highlightColor: cs.primary.withValues(alpha: 0.06),
@@ -2536,21 +2647,33 @@ class _HomeScreenState extends State<HomeScreen>
                 paddockName: name,
                 harvestPerHaText: harv,
                 isUpcoming: isUpcoming,
-                onTap: pdk == null
+                selectionMode: _grazingListSelectionMode,
+                isSelected: _selectedGrazingIds.contains(g.id),
+                onLongPress: () => _enterGrazingListSelectionMode(g.id),
+                onToggleSelected: () => _toggleGrazingListSelection(g.id),
+                onTap: () async {
+                  if (_grazingListSelectionMode) {
+                    _toggleGrazingListSelection(g.id);
+                    return;
+                  }
+                  if (pdk == null) return;
+                  await Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => PaddockHistoryScreen(paddock: pdk!),
+                    ),
+                  );
+                  await _refreshHome();
+                },
+                onRescheduleUpcoming: _grazingListSelectionMode
                     ? null
-                    : () async {
-                        await Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) =>
-                                PaddockHistoryScreen(paddock: pdk!),
-                          ),
-                        );
-                        await _refreshHome();
-                      },
-                onRescheduleUpcoming:
-                    isUpcoming ? () => _rescheduleUpcomingGrazing(g) : null,
-                onDeleteUpcoming:
-                    isUpcoming ? () => _deleteSingleUpcomingGrazing(g) : null,
+                    : isUpcoming
+                    ? () => _rescheduleUpcomingGrazing(g)
+                    : null,
+                onDeleteUpcoming: _grazingListSelectionMode
+                    ? null
+                    : isUpcoming
+                    ? () => _deleteSingleUpcomingGrazing(g)
+                    : null,
               ),
             );
             if (i < list.length - 1) {
@@ -2565,16 +2688,18 @@ class _HomeScreenState extends State<HomeScreen>
               context,
               cs,
               'Upcoming',
-              trailing: TextButton(
-                onPressed: () => _deleteAllUpcomingGrazings(upcoming.length),
-                style: TextButton.styleFrom(
-                  foregroundColor: Theme.of(context).colorScheme.error,
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  minimumSize: Size.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-                child: const Text('Delete all'),
-              ),
+              trailing: _grazingListSelectionMode
+                  ? null
+                  : TextButton(
+                      onPressed: () => _deleteAllUpcomingGrazings(upcoming.length),
+                      style: TextButton.styleFrom(
+                        foregroundColor: Theme.of(context).colorScheme.error,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: const Text('Delete all'),
+                    ),
             ),
           );
           addGrazingRows(upcoming, true);
@@ -2595,6 +2720,8 @@ class _HomeScreenState extends State<HomeScreen>
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               child: Row(
                 children: [
+                  if (_grazingListSelectionMode)
+                    const SizedBox(width: 40),
                   SizedBox(
                     width: 108,
                     child: Text(
@@ -2706,7 +2833,11 @@ class _HomeScreenState extends State<HomeScreen>
     required String paddockName,
     required String harvestPerHaText,
     required bool isUpcoming,
-    VoidCallback? onTap,
+    required bool selectionMode,
+    required bool isSelected,
+    required VoidCallback onLongPress,
+    required VoidCallback onToggleSelected,
+    required VoidCallback onTap,
     Future<void> Function()? onRescheduleUpcoming,
     Future<void> Function()? onDeleteUpcoming,
   }) {
@@ -2751,57 +2882,65 @@ class _HomeScreenState extends State<HomeScreen>
             ),
     );
 
-    final hasMenu =
-        isUpcoming && (onRescheduleUpcoming != null || onDeleteUpcoming != null);
+    final hasMenu = !selectionMode &&
+        isUpcoming &&
+        (onRescheduleUpcoming != null || onDeleteUpcoming != null);
 
     final inner = Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       child: Row(
         children: [
+          if (selectionMode)
+            SizedBox(
+              width: 28,
+              child: Checkbox(
+                value: isSelected,
+                onChanged: (_) => onToggleSelected(),
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
           dateCol,
           Expanded(
-            child: InkWell(
-              onTap: onTap,
-              child: Row(
-                children: [
-                  Expanded(
-                    flex: 2,
-                    child: Text(
-                      paddockName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                      ),
+            child: Row(
+              children: [
+                Expanded(
+                  flex: 2,
+                  child: Text(
+                    paddockName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
-                  SizedBox(
-                    width: 44,
-                    child: Text(
-                      '${g.preCover}',
-                      textAlign: TextAlign.end,
-                      style: const TextStyle(fontSize: 13),
-                    ),
+                ),
+                SizedBox(
+                  width: 44,
+                  child: Text(
+                    '${g.preCover}',
+                    textAlign: TextAlign.end,
+                    style: const TextStyle(fontSize: 13),
                   ),
-                  SizedBox(
-                    width: 44,
-                    child: Text(
-                      '${g.residual}',
-                      textAlign: TextAlign.end,
-                      style: const TextStyle(fontSize: 13),
-                    ),
+                ),
+                SizedBox(
+                  width: 44,
+                  child: Text(
+                    '${g.residual}',
+                    textAlign: TextAlign.end,
+                    style: const TextStyle(fontSize: 13),
                   ),
-                  SizedBox(
-                    width: 48,
-                    child: Text(
-                      harvestPerHaText,
-                      textAlign: TextAlign.end,
-                      style: const TextStyle(fontSize: 13),
-                    ),
+                ),
+                SizedBox(
+                  width: 48,
+                  child: Text(
+                    harvestPerHaText,
+                    textAlign: TextAlign.end,
+                    style: const TextStyle(fontSize: 13),
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
           if (hasMenu)
@@ -2861,9 +3000,23 @@ class _HomeScreenState extends State<HomeScreen>
           )
         : inner;
 
+    final rowColor = selectionMode && isSelected
+        ? colorScheme.primaryContainer.withValues(alpha: 0.45)
+        : Colors.transparent;
+
     return Material(
-      color: Colors.transparent,
-      child: decorated,
+      color: rowColor,
+      child: InkWell(
+        onTap: onTap,
+        onLongPress: () {
+          if (selectionMode) {
+            onToggleSelected();
+          } else {
+            onLongPress();
+          }
+        },
+        child: decorated,
+      ),
     );
   }
 

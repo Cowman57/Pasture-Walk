@@ -306,6 +306,22 @@ class Storage {
     return best;
   }
 
+  /// Latest measurement strictly before [day]'s calendar date (excludes same-day).
+  static Measurement? latestMeasurementBeforeDay(
+    List<Measurement> all,
+    String paddockId,
+    DateTime day,
+  ) {
+    final dayStart = DateTime(day.year, day.month, day.day);
+    Measurement? best;
+    for (final m in all) {
+      if (m.paddockId != paddockId) continue;
+      if (!m.at.isBefore(dayStart)) continue;
+      if (best == null || m.at.isAfter(best.at)) best = m;
+    }
+    return best;
+  }
+
   /// Same rules as [latestAnchorForPaddockAsOf] using pre-loaded lists (batch use).
   static Anchor? latestAnchorFromLists(
     List<Measurement> allMeasurements,
