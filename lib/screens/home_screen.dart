@@ -204,16 +204,16 @@ class _HomeScreenState extends State<HomeScreen>
   bool loaded = false;
   List<Paddock> paddocks = [];
 
-  // Sorting: click header toggles asc/desc only
-  String sortCol = Storage.colPaddock;
-  bool sortAsc = true;
-
   // Layout
   static const double leftColW = 120;
   static const double cowColW = 28;
 
   static const String colRecorded = 'recorded';
   static const String colPredicted = 'predictedNow';
+
+  // Sorting: default highest predicted cover first
+  String sortCol = colPredicted;
+  bool sortAsc = false;
 
   // Selection mode for grazing entry (paddocks / map)
   bool selectionMode = false;
@@ -2121,9 +2121,8 @@ class _HomeScreenState extends State<HomeScreen>
         storage.effectiveFarmGrowthKgDmPerHaPerDay(),
         storage.loadAreaGrazedPerDayHa(),
         storage.loadCoverTrendTimescale(),
-        storage.loadFeedWedgePreGrazingTarget(),
-        storage.loadFeedWedgePostGrazingResidualTarget(),
         storage.loadPaddocks(),
+        storage.loadAllGrazings(),
       ]),
       builder: (context, snap) {
         final data = snap.data;
@@ -2136,15 +2135,17 @@ class _HomeScreenState extends State<HomeScreen>
         final timescale = (data != null && data.length > 2)
             ? (data[2] as String)
             : 'day';
-        final preTarget = (data != null && data.length > 3)
-            ? (data[3] as int)
-            : 2800;
-        final postResidual = (data != null && data.length > 4)
-            ? (data[4] as int)
-            : 1500;
-        final allPaddocks = (data != null && data.length > 5)
-            ? (data[5] as List<Paddock>)
+        final allPaddocks = (data != null && data.length > 3)
+            ? (data[3] as List<Paddock>)
             : <Paddock>[];
+        final allGrazings = (data != null && data.length > 4)
+            ? (data[4] as List<Grazing>)
+            : <Grazing>[];
+
+        final includedIds = allPaddocks
+            .where((p) => p.includeInRotation)
+            .map((p) => p.id)
+            .toSet();
 
         final includedArea = allPaddocks
             .where((p) => p.includeInRotation)
@@ -2154,9 +2155,29 @@ class _HomeScreenState extends State<HomeScreen>
             ? (includedArea / areaPerDay)
             : null;
 
-        final requiredGrowth = (roundLengthDays == null || roundLengthDays <= 0)
-            ? null
-            : (preTarget - postResidual) / roundLengthDays;
+        // Cover trend: avg actual pre/post from last 7 days of past grazings only.
+        final now = DateTime.now();
+        final since = now.subtract(const Duration(days: 7));
+        final recentPast = allGrazings
+            .where(
+              (g) =>
+                  includedIds.contains(g.paddockId) &&
+                  !g.at.isAfter(now) &&
+                  !g.at.isBefore(since),
+            )
+            .toList();
+        double? requiredGrowth;
+        if (roundLengthDays != null &&
+            roundLengthDays > 0 &&
+            recentPast.isNotEmpty) {
+          final avgPre =
+              recentPast.map((g) => g.preCover).reduce((a, b) => a + b) /
+              recentPast.length;
+          final avgPost =
+              recentPast.map((g) => g.residual).reduce((a, b) => a + b) /
+              recentPast.length;
+          requiredGrowth = (avgPre - avgPost) / roundLengthDays;
+        }
 
         final deltaPerDay = requiredGrowth == null
             ? null
@@ -2182,10 +2203,6 @@ class _HomeScreenState extends State<HomeScreen>
         final roundText = roundLengthDays == null
             ? '—'
             : roundLengthDays.toStringAsFixed(1);
-
-        final reqGrowthText = requiredGrowth == null
-            ? '—'
-            : requiredGrowth.toStringAsFixed(1);
 
         return Column(
           children: [
@@ -2371,7 +2388,7 @@ class _HomeScreenState extends State<HomeScreen>
                             ),
                             const SizedBox(height: 2),
                             Text(
-                              '$timescaleUnit  (req $reqGrowthText)',
+                              timescaleUnit,
                               style: const TextStyle(
                                 fontSize: 11,
                                 color: Colors.black54,
@@ -3274,27 +3291,57 @@ class _FeedWedge extends StatelessWidget {
     required this.onChanged,
   });
 
+  Future<({int? avgPre, int? avgPost})> _autoPrePost() async {
+    final paddocksAll = await storage.loadPaddocks();
+    final includedIds = paddocksAll
+        .where((p) => p.includeInRotation)
+        .map((p) => p.id)
+        .toSet();
+    final avg = await storage.avgGrazingPrePostLastDays(
+      days: 7,
+      includedPaddockIds: includedIds,
+    );
+    return (avgPre: avg.avgPre, avgPost: avg.avgPost);
+  }
+
   Future<void> _editTargets(BuildContext context) async {
-    final pre0 = await storage.loadFeedWedgePreGrazingTarget();
-    final post0 = await storage.loadFeedWedgePostGrazingResidualTarget();
+    final auto = await _autoPrePost();
+    final preOverride = await storage.loadFeedWedgePreGrazingOverride();
+    final postOverride = await storage.loadFeedWedgePostGrazingResidualOverride();
     if (!context.mounted) return;
 
-    final preCtrl = TextEditingController(text: pre0.toString());
-    final postCtrl = TextEditingController(text: post0.toString());
+    final preCtrl = TextEditingController(
+      text: (preOverride ?? auto.avgPre)?.toString() ?? '',
+    );
+    final postCtrl = TextEditingController(
+      text: (postOverride ?? auto.avgPost)?.toString() ?? '',
+    );
+    final autoLabel = (auto.avgPre != null && auto.avgPost != null)
+        ? 'Auto from last 7 days: ${auto.avgPre} → ${auto.avgPost}'
+        : 'Auto: no grazings in last 7 days';
 
-    final ok = await showDialog<bool>(
+    final result = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Feed wedge targets'),
+        title: const Text('Feed wedge pre / post'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            Text(
+              autoLabel,
+              style: TextStyle(
+                fontSize: 13,
+                color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 12),
             TextField(
               controller: preCtrl,
               keyboardType: TextInputType.number,
               decoration: const InputDecoration(
-                labelText: 'Pre-grazing cover target',
-                helperText: 'kgDM/ha',
+                labelText: 'Pre-grazing cover',
+                helperText: 'kgDM/ha (leave blank for auto)',
                 border: OutlineInputBorder(),
               ),
             ),
@@ -3303,8 +3350,8 @@ class _FeedWedge extends StatelessWidget {
               controller: postCtrl,
               keyboardType: TextInputType.number,
               decoration: const InputDecoration(
-                labelText: 'Post-grazing residual target',
-                helperText: 'kgDM/ha',
+                labelText: 'Post-grazing residual',
+                helperText: 'kgDM/ha (leave blank for auto)',
                 border: OutlineInputBorder(),
               ),
             ),
@@ -3312,42 +3359,74 @@ class _FeedWedge extends StatelessWidget {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
+            onPressed: () => Navigator.pop(ctx, 'cancel'),
             child: const Text('Cancel'),
           ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'auto'),
+            child: const Text('Use auto'),
+          ),
           ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
+            onPressed: () => Navigator.pop(ctx, 'save'),
             child: const Text('Save'),
           ),
         ],
       ),
     );
 
-    if (ok != true) return;
+    if (result == null || result == 'cancel') return;
 
-    final pre = int.tryParse(preCtrl.text.trim());
-    final post = int.tryParse(postCtrl.text.trim());
-    if (pre == null || post == null) return;
+    if (result == 'auto') {
+      await storage.clearFeedWedgePreGrazingOverride();
+      await storage.clearFeedWedgePostGrazingResidualOverride();
+      await onChanged();
+      return;
+    }
 
-    await storage.saveFeedWedgePreGrazingTarget(pre);
-    await storage.saveFeedWedgePostGrazingResidualTarget(post);
+    final preText = preCtrl.text.trim();
+    final postText = postCtrl.text.trim();
+    if (preText.isEmpty) {
+      await storage.clearFeedWedgePreGrazingOverride();
+    } else {
+      final pre = int.tryParse(preText);
+      if (pre == null) return;
+      await storage.saveFeedWedgePreGrazingTarget(pre);
+    }
+    if (postText.isEmpty) {
+      await storage.clearFeedWedgePostGrazingResidualOverride();
+    } else {
+      final post = int.tryParse(postText);
+      if (post == null) return;
+      await storage.saveFeedWedgePostGrazingResidualTarget(post);
+    }
     await onChanged();
   }
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<List<int>>(
+    return FutureBuilder<List<dynamic>>(
       future: Future.wait([
-        storage.loadFeedWedgePreGrazingTarget(),
-        storage.loadFeedWedgePostGrazingResidualTarget(),
+        storage.loadFeedWedgePreGrazingOverride(),
+        storage.loadFeedWedgePostGrazingResidualOverride(),
+        _autoPrePost(),
       ]),
       builder: (context, snap) {
-        final pre = (snap.data == null || snap.data!.isEmpty)
-            ? 2800
-            : snap.data![0];
-        final post = (snap.data == null || snap.data!.length < 2)
-            ? 1500
-            : snap.data![1];
+        final preOverride = (snap.data != null && snap.data!.isNotEmpty)
+            ? snap.data![0] as int?
+            : null;
+        final postOverride = (snap.data != null && snap.data!.length > 1)
+            ? snap.data![1] as int?
+            : null;
+        final auto = (snap.data != null && snap.data!.length > 2)
+            ? snap.data![2] as ({int? avgPre, int? avgPost})
+            : (avgPre: null, avgPost: null);
+
+        final pre = preOverride ?? auto.avgPre ?? 2800;
+        final post = postOverride ?? auto.avgPost ?? 1500;
+        final isAuto = preOverride == null && postOverride == null;
+        final buttonLabel = isAuto
+            ? 'Auto: $pre → $post'
+            : 'Override: $pre → $post';
 
         final screenW = MediaQuery.of(context).size.width;
         final plotW = (paddocks.length * 26).toDouble();
@@ -3374,7 +3453,7 @@ class _FeedWedge extends StatelessWidget {
                     ),
                     TextButton(
                       onPressed: () => _editTargets(context),
-                      child: Text('Targets: $pre → $post'),
+                      child: Text(buttonLabel),
                     ),
                   ],
                 ),

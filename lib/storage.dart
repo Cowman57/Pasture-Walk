@@ -146,9 +146,11 @@ class Storage {
     );
   }
 
-  Future<int> loadFeedWedgePreGrazingTarget() async {
+  /// Manual feed-wedge override; null means use auto avg from recent grazings.
+  Future<int?> loadFeedWedgePreGrazingOverride() async {
     final sp = await SharedPreferences.getInstance();
-    return sp.getInt(_feedWedgePreTargetKey) ?? 2800;
+    if (!sp.containsKey(_feedWedgePreTargetKey)) return null;
+    return sp.getInt(_feedWedgePreTargetKey);
   }
 
   Future<void> saveFeedWedgePreGrazingTarget(int v) async {
@@ -157,15 +159,56 @@ class Storage {
     await sp.setInt(_feedWedgePreTargetKey, safe);
   }
 
-  Future<int> loadFeedWedgePostGrazingResidualTarget() async {
+  Future<void> clearFeedWedgePreGrazingOverride() async {
     final sp = await SharedPreferences.getInstance();
-    return sp.getInt(_feedWedgePostResidualTargetKey) ?? 1500;
+    await sp.remove(_feedWedgePreTargetKey);
+  }
+
+  /// Manual feed-wedge override; null means use auto avg from recent grazings.
+  Future<int?> loadFeedWedgePostGrazingResidualOverride() async {
+    final sp = await SharedPreferences.getInstance();
+    if (!sp.containsKey(_feedWedgePostResidualTargetKey)) return null;
+    return sp.getInt(_feedWedgePostResidualTargetKey);
   }
 
   Future<void> saveFeedWedgePostGrazingResidualTarget(int v) async {
     final sp = await SharedPreferences.getInstance();
     final safe = v.clamp(0, 999999999);
     await sp.setInt(_feedWedgePostResidualTargetKey, safe);
+  }
+
+  Future<void> clearFeedWedgePostGrazingResidualOverride() async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.remove(_feedWedgePostResidualTargetKey);
+  }
+
+  /// Average preCover / residual from past grazings in the last [days] days
+  /// for [includedPaddockIds]. Returns nulls when there are no matching events.
+  Future<({int? avgPre, int? avgPost, int count})> avgGrazingPrePostLastDays({
+    required int days,
+    required Set<String> includedPaddockIds,
+  }) async {
+    final now = DateTime.now();
+    final since = now.subtract(Duration(days: days));
+    final gs = await loadAllGrazings();
+    final recent = gs
+        .where(
+          (g) =>
+              includedPaddockIds.contains(g.paddockId) &&
+              !g.at.isAfter(now) &&
+              !g.at.isBefore(since),
+        )
+        .toList();
+    if (recent.isEmpty) {
+      return (avgPre: null, avgPost: null, count: 0);
+    }
+    final avgPre =
+        (recent.map((g) => g.preCover).reduce((a, b) => a + b) / recent.length)
+            .round();
+    final avgPost =
+        (recent.map((g) => g.residual).reduce((a, b) => a + b) / recent.length)
+            .round();
+    return (avgPre: avgPre, avgPost: avgPost, count: recent.length);
   }
 
   Future<double> loadAreaGrazedPerDayHa() async {
