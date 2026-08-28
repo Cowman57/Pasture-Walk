@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 import 'package:uuid/uuid.dart';
 import 'dart:math' as math;
@@ -14,7 +13,19 @@ import 'round_screen.dart';
 import 'settings_screen.dart';
 import 'paddock_history_screen.dart';
 import 'avg_cover_history_screen.dart';
+import 'grazing_accuracy_screen.dart';
 import 'grazing_schedule_preview_screen.dart';
+import '../widgets/grazing_calendar_board.dart';
+
+const _coverHeatStops = <(double, Color)>[
+  (1400, Color(0xFFD32F2F)),
+  (1800, Color(0xFFEF6C00)),
+  (1900, Color(0xFFFDD835)),
+  (2300, Color(0xFFC5E1A5)),
+  (2900, Color(0xFF1B5E20)),
+  (3000, Color(0xFF4FC3F7)),
+  (3200, Color(0xFF0D47A1)),
+];
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -41,6 +52,107 @@ class _MapBounds {
     final maxLon = math.max(northEast.longitude, p.longitude);
     southWest = ll.LatLng(minLat, minLon);
     northEast = ll.LatLng(maxLat, maxLon);
+  }
+}
+
+class _CoverHeatKey extends StatelessWidget {
+  const _CoverHeatKey();
+
+  static const _minCover = 1400.0;
+  static const _maxCover = 3200.0;
+  static const _labels = [3200, 2900, 2300, 1800, 1400];
+  static const _barH = 152.0;
+  static const _labelH = 14.0;
+
+  @override
+  Widget build(BuildContext context) {
+    final minC = _coverHeatStops.first.$1;
+    final span = _coverHeatStops.last.$1 - minC;
+    final colors = [for (final s in _coverHeatStops) s.$2];
+    final stops = [
+      for (final s in _coverHeatStops) ((s.$1 - minC) / span).clamp(0.0, 1.0),
+    ];
+
+    return Material(
+      color: Colors.white.withValues(alpha: 0.92),
+      elevation: 2,
+      shadowColor: Colors.black.withValues(alpha: 0.18),
+      borderRadius: BorderRadius.circular(10),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              'kgDM/ha',
+              style: TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 0.2,
+                color: Colors.black.withValues(alpha: 0.62),
+              ),
+            ),
+            const SizedBox(height: 6),
+            SizedBox(
+              height: _barH + _labelH,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.only(top: _labelH / 2),
+                    child: Container(
+                      width: 14,
+                      height: _barH,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(
+                          color: Colors.black.withValues(alpha: 0.28),
+                        ),
+                        gradient: LinearGradient(
+                          begin: Alignment.bottomCenter,
+                          end: Alignment.topCenter,
+                          colors: colors,
+                          stops: stops,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  SizedBox(
+                    width: 40,
+                    height: _barH + _labelH,
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        for (final cover in _labels)
+                          Positioned(
+                            top:
+                                (1.0 -
+                                    (cover - _minCover) /
+                                        (_maxCover - _minCover)) *
+                                _barH,
+                            left: 0,
+                            child: Text(
+                              cover >= 3200 ? '3200+' : '$cover',
+                              style: TextStyle(
+                                fontSize: 11,
+                                height: 1.2,
+                                fontWeight: FontWeight.w800,
+                                color: Colors.black.withValues(alpha: 0.82),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -189,7 +301,7 @@ class _HomeScreenState extends State<HomeScreen>
   final MapController _mapController = MapController();
   bool _mapFitApplied = false;
   int _mapLayer = 1;
-  double _mapZoom = 15;
+  final _mapZoom = ValueNotifier<double>(15);
 
   late final proj4.Projection _wgs84 =
       proj4.Projection.get('EPSG:4326') ?? proj4.Projection.WGS84;
@@ -220,18 +332,28 @@ class _HomeScreenState extends State<HomeScreen>
   final Set<String> selectedPaddockIds = {};
   int residual = 1600;
 
-  // Selection mode for deleting grazings from the Grazings tab
-  bool _grazingListSelectionMode = false;
-  final Set<String> _selectedGrazingIds = {};
+  /// Grazings tab calendar: view by default; edit requires explicit mode.
+  bool _grazingCalEdit = false;
+  bool _grazingCalLeavePromptOpen = false;
+  List<GrazingCalendarBlock>? _grazingCalWorking;
+  ({List<GrazingCalendarBlock> blocks, double target})? _grazingCalData;
+  Future<({List<GrazingCalendarBlock> blocks, double target})>?
+      _grazingCalFuture;
 
   final Set<String> _selectedSummaryNoteIds = {};
 
   int _tabIndex = 0;
+  int _herdFeedPage = 0;
+  bool _grazingsTabMounted = false;
+  bool _mapTabMounted = false;
 
   /// Map is the last home tab; used for grazing multi-select layout (bar + map).
   static const int _kMapTabIndex = 3;
 
   Future<List<_RowData>>? _rowsFuture;
+  Future<List<dynamic>>? _summaryCardsFuture;
+  Future<List<dynamic>>? _summaryWedgeFuture;
+  Future<List<dynamic>>? _summaryNotesFuture;
 
   /// Avoid refetching map polygons/notes on every selection toggle.
   Future<List<dynamic>>? _mapTabDataFuture;
@@ -253,6 +375,7 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   void dispose() {
     _grazingBarDropController.dispose();
+    _mapZoom.dispose();
     super.dispose();
   }
 
@@ -276,190 +399,197 @@ class _HomeScreenState extends State<HomeScreen>
     loaded = true;
     _rowsFuture = _buildRows();
     _mapTabDataFuture = null;
+    _summaryCardsFuture = null;
+    _summaryWedgeFuture = null;
+    _summaryNotesFuture = null;
     if (mounted) setState(() {});
   }
 
   Future<void> _refreshHome() async {
+    _grazingCalFuture = null;
+    _grazingCalData = null;
+    if (!_grazingCalEdit) {
+      _grazingCalWorking = null;
+    }
     await _load();
     if (mounted) setState(() {});
   }
 
-  Future<DateTime?> _pickScheduleDateTime(DateTime initial) async {
-    final d = await showDatePicker(
-      context: context,
-      initialDate: DateTime(initial.year, initial.month, initial.day),
-      firstDate: DateTime(2000),
-      lastDate: DateTime(2100),
-    );
-    if (d == null || !mounted) return null;
-    final t = await showTimePicker(
-      context: context,
-      initialTime: TimeOfDay.fromDateTime(initial),
-    );
-    if (t == null || !mounted) return null;
-    return DateTime(d.year, d.month, d.day, t.hour, t.minute);
-  }
-
-  Future<void> _rescheduleUpcomingGrazing(Grazing g) async {
-    final next = await _pickScheduleDateTime(g.at);
-    if (next == null || !mounted) return;
-    final now = DateTime.now();
-    if (!next.isAfter(now)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Choose a date and time in the future.'),
+  Future<({List<GrazingCalendarBlock> blocks, double target})>
+      _loadGrazingCalendar() async {
+    final herds = await storage.loadHerds();
+    final allPaddocks = await storage.loadPaddocks();
+    final grazings = await storage.loadAllGrazings();
+    final pById = {for (final p in allPaddocks) p.id: p};
+    final target = Storage.totalAreaGrazedPerDayHa(herds);
+    final blocks = <GrazingCalendarBlock>[];
+    for (final g in grazings) {
+      final p = pById[g.paddockId];
+      if (p == null) continue;
+      blocks.add(
+        GrazingCalendarBlock(
+          id: g.id,
+          paddockId: g.paddockId,
+          paddockName: p.name,
+          areaHa: p.areaHa,
+          startDay: g.at,
+          durationDays: g.durationDays,
+          isDraft: false,
+          locked: false,
+          preCover: g.preCover,
+          residual: g.residual,
+          harvestedKgDm: g.harvestedKgDm,
+          enteredAt: g.enteredAt,
         ),
       );
-      return;
     }
-    await storage.updateGrazing(
-      Grazing(
-        id: g.id,
-        paddockId: g.paddockId,
-        at: next,
-        enteredAt: g.enteredAt,
-        preCover: g.preCover,
-        residual: g.residual,
-        harvestedKgDm: g.harvestedKgDm,
-      ),
-    );
-    if (!mounted) return;
-    await _refreshHome();
+    return (blocks: blocks, target: target);
   }
 
-  Future<void> _deleteSingleUpcomingGrazing(Grazing g) async {
-    final ok = await showDialog<bool>(
+  Future<({List<GrazingCalendarBlock> blocks, double target})>
+      _ensureGrazingCalFuture() {
+    return _grazingCalFuture ??= _loadGrazingCalendar().then((data) {
+      _grazingCalData = data;
+      if (mounted) setState(() {});
+      return data;
+    });
+  }
+
+  void _enterGrazingCalEdit(List<GrazingCalendarBlock> blocks) {
+    setState(() {
+      _grazingCalEdit = true;
+      _grazingCalWorking = blocks.map((b) => b.copyWith()).toList();
+    });
+  }
+
+  void _cancelGrazingCalEdit() {
+    setState(() {
+      _grazingCalEdit = false;
+      _grazingCalWorking = null;
+      _grazingCalFuture = null;
+    });
+  }
+
+  Future<bool> _promptSaveGrazingCalIfNeeded() async {
+    if (!_grazingCalEdit) return true;
+
+    final action = await showDialog<int>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Delete scheduled grazing?'),
+        title: const Text('Save grazings?'),
         content: const Text(
-          'Remove this scheduled event from the list? This cannot be undone.',
+          'You have unsaved grazing edits. Save them before leaving this tab?',
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
+            onPressed: () => Navigator.pop(ctx, 2),
+            child: const Text("Don't save"),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 0),
             child: const Text('Cancel'),
           ),
           FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Delete'),
+            onPressed: () => Navigator.pop(ctx, 1),
+            child: const Text('Save'),
           ),
         ],
       ),
     );
-    if (ok != true || !mounted) return;
-    await storage.deleteGrazingById(g.id);
-    if (!mounted) return;
-    await _refreshHome();
-  }
 
-  void _enterGrazingListSelectionMode(String grazingId) {
-    HapticFeedback.mediumImpact();
-    setState(() {
-      _grazingListSelectionMode = true;
-      _selectedGrazingIds.add(grazingId);
-    });
-  }
-
-  void _toggleGrazingListSelection(String grazingId) {
-    setState(() {
-      if (_selectedGrazingIds.contains(grazingId)) {
-        _selectedGrazingIds.remove(grazingId);
-        if (_selectedGrazingIds.isEmpty) {
-          _grazingListSelectionMode = false;
-        }
-      } else {
-        _selectedGrazingIds.add(grazingId);
-      }
-    });
-  }
-
-  void _cancelGrazingListSelection() {
-    setState(() {
-      _grazingListSelectionMode = false;
-      _selectedGrazingIds.clear();
-    });
-  }
-
-  Future<void> _deleteSelectedGrazings() async {
-    if (_selectedGrazingIds.isEmpty) return;
-    final count = _selectedGrazingIds.length;
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete selected grazings?'),
-        content: Text(
-          'Remove $count grazing event${count == 1 ? '' : 's'}? '
-          'This cannot be undone.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              foregroundColor: Theme.of(ctx).colorScheme.onError,
-              backgroundColor: Theme.of(ctx).colorScheme.error,
-            ),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (ok != true || !mounted) return;
-    for (final id in _selectedGrazingIds) {
-      await storage.deleteGrazingById(id);
+    if (!mounted) return false;
+    if (action == null || action == 0) return false;
+    if (action == 1) {
+      await _saveGrazingCalEdit();
+      return mounted;
     }
-    if (!mounted) return;
-    setState(() {
-      _grazingListSelectionMode = false;
-      _selectedGrazingIds.clear();
-    });
-    await _refreshHome();
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Removed $count grazing event${count == 1 ? '' : 's'}.'),
-      ),
-    );
+    _cancelGrazingCalEdit();
+    return true;
   }
 
-  Future<void> _deleteAllUpcomingGrazings(int count) async {
-    if (count <= 0) return;
+  Future<void> _selectHomeTab(int index) async {
+    if (index == _tabIndex) return;
+    if (_grazingCalLeavePromptOpen) return;
+    if (_grazingCalEdit && index != 2) {
+      _grazingCalLeavePromptOpen = true;
+      final leave = await _promptSaveGrazingCalIfNeeded();
+      _grazingCalLeavePromptOpen = false;
+      if (!leave || !mounted) return;
+    }
+    setState(() {
+      if (index == 2) _grazingsTabMounted = true;
+      if (index == 3) _mapTabMounted = true;
+      _tabIndex = index;
+    });
+  }
+
+  Future<void> _saveGrazingCalEdit() async {
+    final working = _grazingCalWorking;
+    if (working == null) return;
+    final existing = await storage.loadAllGrazings();
+    final byId = {for (final g in existing) g.id: g};
+    final keepIds = working.map((b) => b.id).toSet();
+
+    for (final g in existing) {
+      if (!keepIds.contains(g.id)) {
+        await storage.deleteGrazingById(g.id);
+      }
+    }
+
+    for (final b in working) {
+      final prev = byId[b.id];
+      final at = DateTime(
+        b.startDay.year,
+        b.startDay.month,
+        b.startDay.day,
+        prev?.at.hour ?? 12,
+        prev?.at.minute ?? 0,
+      );
+      await storage.updateGrazing(
+        Grazing(
+          id: b.id,
+          paddockId: b.paddockId,
+          at: at,
+          enteredAt: b.enteredAt ?? prev?.enteredAt ?? at,
+          preCover: b.preCover ?? prev?.preCover ?? 2500,
+          residual: b.residual ?? prev?.residual ?? residual,
+          harvestedKgDm: b.harvestedKgDm ?? prev?.harvestedKgDm ?? 0,
+          durationDays: b.durationDays < 1 ? 1 : b.durationDays,
+        ),
+      );
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _grazingCalEdit = false;
+      _grazingCalWorking = null;
+      _grazingCalFuture = null;
+    });
+    await _refreshHome();
+  }
+
+  Future<void> _deleteGrazingCalBlock(GrazingCalendarBlock b) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Delete all upcoming grazings?'),
-        content: Text(
-          'Remove all $count scheduled grazing event${count == 1 ? '' : 's'}? '
-          'This cannot be undone.',
-        ),
+        title: const Text('Delete grazing?'),
+        content: Text('Remove ${b.paddockName} from the schedule?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
             child: const Text('Cancel'),
           ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              foregroundColor: Theme.of(ctx).colorScheme.onError,
-              backgroundColor: Theme.of(ctx).colorScheme.error,
-            ),
+          TextButton(
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Delete all'),
+            child: const Text('Delete'),
           ),
         ],
       ),
     );
     if (ok != true || !mounted) return;
-    final removed = await storage.deleteAllGrazingsAfter(DateTime.now());
-    if (!mounted) return;
-    await _refreshHome();
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Removed $removed scheduled event${removed == 1 ? '' : 's'}.')),
-    );
+    setState(() {
+      _grazingCalWorking?.removeWhere((x) => x.id == b.id);
+    });
   }
 
   bool _sameDay(DateTime a, DateTime b) =>
@@ -782,129 +912,181 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          selectionMode
-              ? 'Select paddocks'
-              : _grazingListSelectionMode
-              ? 'Select grazings'
-              : 'Pasture Walk',
-        ),
-        leading: selectionMode
-            ? IconButton(
-                icon: const Icon(Icons.close),
-                onPressed: _cancelSelection,
-              )
-            : _grazingListSelectionMode
-            ? IconButton(
-                icon: const Icon(Icons.close),
-                onPressed: _cancelGrazingListSelection,
-              )
-            : null,
-        actions: [
-          if (_grazingListSelectionMode)
-            TextButton(
-              onPressed: _selectedGrazingIds.isEmpty
-                  ? null
-                  : _deleteSelectedGrazings,
-              child: Text(
-                'Delete (${_selectedGrazingIds.length})',
-                style: TextStyle(
-                  color: _selectedGrazingIds.isEmpty
-                      ? Theme.of(context).disabledColor
-                      : Theme.of(context).colorScheme.error,
-                ),
-              ),
-            ),
-          if (!selectionMode && !_grazingListSelectionMode)
-            IconButton(
-              icon: const Icon(Icons.settings),
-              onPressed: () async {
-                await Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const SettingsScreen()),
-                );
-                await _refreshHome();
-              },
-            ),
-        ],
-      ),
-      body: !loaded
-          ? const Center(child: CircularProgressIndicator())
-          : FutureBuilder<List<_RowData>>(
-              future: _rowsFuture,
-              builder: (context, snap) {
-                if (!snap.hasData) {
-                  return const Center(child: CircularProgressIndicator());
-                }
+      body: SafeArea(
+        bottom: false,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _topNavBar(),
+            if (!selectionMode) _tabs(),
+            Expanded(
+              child: !loaded
+                  ? const Center(child: CircularProgressIndicator())
+                  : FutureBuilder<List<_RowData>>(
+                      future: _rowsFuture,
+                      builder: (context, snap) {
+                        if (!snap.hasData) {
+                          return const Center(
+                            child: CircularProgressIndicator(),
+                          );
+                        }
 
-                final rows = [...(snap.data ?? <_RowData>[])];
-                rows.sort((a, b) => _compare(a, b));
+                        final rows = [...(snap.data ?? <_RowData>[])];
+                        rows.sort((a, b) => _compare(a, b));
 
-                return Column(
-                  children: [
-                    if (!selectionMode) _tabs(),
-                    if (!selectionMode)
-                      Expanded(
-                        child: IndexedStack(
-                          index: _tabIndex,
-                          sizing: StackFit.expand,
-                          children: [
-                            _summaryTab(rows),
-                            _paddocksTab(rows),
-                            _grazingsTab(rows),
-                            _mapTab(rows),
-                          ],
-                        ),
-                      ),
-                    if (selectionMode && _tabIndex == _kMapTabIndex)
-                      Expanded(
-                        child: LayoutBuilder(
-                          builder: (context, constraints) {
-                            final maxBarH = (constraints.maxHeight * 0.5)
-                                .clamp(120.0, 520.0);
-                            return Column(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                        if (!selectionMode) {
+                          return ClipRect(
+                            child: IndexedStack(
+                              index: _tabIndex,
+                              sizing: StackFit.expand,
                               children: [
-                                _grazingBarAnimatedShell(
-                                  child: Material(
-                                    elevation: 6,
-                                    shadowColor: Colors.black.withValues(
-                                      alpha: 0.35,
-                                    ),
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .surfaceContainerHighest
-                                        .withValues(alpha: 0.97),
-                                    child: ConstrainedBox(
-                                      constraints: BoxConstraints(
-                                        maxHeight: maxBarH,
+                                _summaryTab(rows),
+                                _paddocksTab(rows),
+                                _grazingsTabMounted
+                                    ? _grazingsTab(rows)
+                                    : const SizedBox.shrink(),
+                                _mapTabMounted
+                                    ? _mapTab(rows)
+                                    : const SizedBox.shrink(),
+                              ],
+                            ),
+                          );
+                        }
+
+                        if (_tabIndex == _kMapTabIndex) {
+                          return LayoutBuilder(
+                            builder: (context, constraints) {
+                              final maxBarH = (constraints.maxHeight * 0.5)
+                                  .clamp(120.0, 520.0);
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  _grazingBarAnimatedShell(
+                                    child: Material(
+                                      elevation: 6,
+                                      shadowColor: Colors.black.withValues(
+                                        alpha: 0.35,
                                       ),
-                                      child: SingleChildScrollView(
-                                        physics: const ClampingScrollPhysics(),
-                                        child: _grazingBar(rows),
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .surfaceContainerHighest
+                                          .withValues(alpha: 0.97),
+                                      child: ConstrainedBox(
+                                        constraints: BoxConstraints(
+                                          maxHeight: maxBarH,
+                                        ),
+                                        child: SingleChildScrollView(
+                                          physics:
+                                              const ClampingScrollPhysics(),
+                                          child: _grazingBar(rows),
+                                        ),
                                       ),
                                     ),
                                   ),
-                                ),
-                                Expanded(child: _mapTab(rows)),
-                              ],
-                            );
-                          },
-                        ),
-                      ),
-                    if (selectionMode && _tabIndex != _kMapTabIndex)
-                      Expanded(child: _paddocksTab(rows)),
-                  ],
-                );
-              },
+                                  Expanded(child: _mapTab(rows)),
+                                ],
+                              );
+                            },
+                          );
+                        }
+
+                        return _paddocksTab(rows);
+                      },
+                    ),
             ),
+          ],
+        ),
+      ),
     );
+  }
+
+  Widget _topNavBar() {
+    final cs = Theme.of(context).colorScheme;
+    return Material(
+      color: cs.surface,
+      child: Container(
+        height: 48,
+        decoration: BoxDecoration(
+          border: Border(
+            bottom: BorderSide(
+              color: cs.outlineVariant.withValues(alpha: 0.45),
+            ),
+          ),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Row(
+          children: [
+            if (selectionMode)
+              IconButton(
+                icon: const Icon(Icons.close),
+                tooltip: 'Cancel selection',
+                onPressed: _cancelSelection,
+              )
+            else
+              const SizedBox(width: 8),
+            if (selectionMode)
+              Expanded(
+                child: Text(
+                  'Select paddocks',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w700,
+                    color: cs.onSurface,
+                  ),
+                ),
+              )
+            else
+              const Spacer(),
+            if (!selectionMode && _tabIndex == 2) ..._grazingCalNavActions(),
+            if (!selectionMode)
+              IconButton(
+                icon: const Icon(Icons.settings_outlined),
+                tooltip: 'Settings',
+                onPressed: () async {
+                  await Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const SettingsScreen()),
+                  );
+                  await _refreshHome();
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _grazingCalNavActions() {
+    if (_grazingCalEdit) {
+      return [
+        TextButton(
+          onPressed: _cancelGrazingCalEdit,
+          child: const Text('Cancel'),
+        ),
+        const SizedBox(width: 4),
+        FilledButton(
+          onPressed: _saveGrazingCalEdit,
+          child: const Text('Save'),
+        ),
+        const SizedBox(width: 4),
+      ];
+    }
+
+    final blocks = _grazingCalData?.blocks;
+    return [
+      TextButton.icon(
+        onPressed: blocks == null
+            ? null
+            : () => _enterGrazingCalEdit(blocks),
+        icon: const Icon(Icons.edit_outlined, size: 18),
+        label: const Text('Edit'),
+      ),
+      const SizedBox(width: 4),
+    ];
   }
 
   Widget _tabs() {
     final cs = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
       child: DecoratedBox(
         decoration: BoxDecoration(
           color: cs.surfaceContainerHighest.withValues(alpha: 0.65),
@@ -948,15 +1130,7 @@ class _HomeScreenState extends State<HomeScreen>
         borderRadius: BorderRadius.circular(14),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: () {
-            setState(() {
-              if (index != 2) {
-                _grazingListSelectionMode = false;
-                _selectedGrazingIds.clear();
-              }
-              _tabIndex = index;
-            });
-          },
+          onTap: () => _selectHomeTab(index),
           borderRadius: BorderRadius.circular(14),
           splashColor: cs.primary.withValues(alpha: 0.12),
           highlightColor: cs.primary.withValues(alpha: 0.06),
@@ -1140,9 +1314,8 @@ class _HomeScreenState extends State<HomeScreen>
                       initialZoom: 15,
                       onMapEvent: (e) {
                         final z = e.camera.zoom;
-                        // Epsilon avoids setState storms from float noise / programmatic moves.
-                        if ((z - _mapZoom).abs() > 1e-4) {
-                          setState(() => _mapZoom = z);
+                        if ((z - _mapZoom.value).abs() > 1e-4) {
+                          _mapZoom.value = z;
                         }
                       },
                       interactionOptions: const InteractionOptions(
@@ -1203,7 +1376,7 @@ class _HomeScreenState extends State<HomeScreen>
                             isFilled: true,
                             color: p.excluded
                                 ? Colors.grey.withValues(alpha: 0.25)
-                                : c.withValues(alpha: sel ? 0.88 : 0.78),
+                                : c.withValues(alpha: sel ? 0.95 : 0.90),
                           );
                         }).toList(),
                       ),
@@ -1220,14 +1393,16 @@ class _HomeScreenState extends State<HomeScreen>
                           return out;
                         }(),
                       ),
-                      MarkerLayer(
+                      ValueListenableBuilder<double>(
+                        valueListenable: _mapZoom,
+                        builder: (context, zoom, _) => MarkerLayer(
                         markers: () {
-                          final ref = _avgBoundsPx(mapPolys, _mapZoom);
+                          final ref = _avgBoundsPx(mapPolys, zoom);
                           final out = <Marker>[];
 
                           for (final p in mapPolys) {
                             final lines = _labelLines(p, ref);
-                            final opacity = _labelOpacity(lines, ref, _mapZoom);
+                            final opacity = _labelOpacity(lines, ref, zoom);
                             final show3 = lines.length >= 3;
 
                             if (p.pending && show3) {
@@ -1347,8 +1522,14 @@ class _HomeScreenState extends State<HomeScreen>
                           return out;
                         }(),
                       ),
+                      ),
                     ],
                   ),
+                ),
+                Positioned(
+                  left: 12,
+                  bottom: 12 + MediaQuery.paddingOf(context).bottom,
+                  child: const _CoverHeatKey(),
                 ),
                 Positioned(
                   right: 12,
@@ -1372,21 +1553,19 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Color _heatColorForCover(int cover) {
+    const stops = _coverHeatStops;
     final v = cover.toDouble();
-    if (v <= 1200) return Colors.red;
-    if (v <= 1600) {
-      final t = ((v - 1200) / (1600 - 1200)).clamp(0.0, 1.0);
-      return Color.lerp(Colors.red, Colors.yellow, t) ?? Colors.yellow;
+    if (v <= stops.first.$1) return stops.first.$2;
+    if (v >= stops.last.$1) return stops.last.$2;
+    for (var i = 1; i < stops.length; i++) {
+      final lo = stops[i - 1];
+      final hi = stops[i];
+      if (v <= hi.$1) {
+        final t = ((v - lo.$1) / (hi.$1 - lo.$1)).clamp(0.0, 1.0);
+        return Color.lerp(lo.$2, hi.$2, t) ?? hi.$2;
+      }
     }
-    if (v <= 2800) {
-      final t = ((v - 1600) / (2800 - 1600)).clamp(0.0, 1.0);
-      return Color.lerp(Colors.yellow, Colors.green, t) ?? Colors.green;
-    }
-    if (v <= 3200) {
-      final t = ((v - 2800) / (3200 - 2800)).clamp(0.0, 1.0);
-      return Color.lerp(Colors.green, Colors.blue, t) ?? Colors.blue;
-    }
-    return Colors.blue;
+    return stops.last.$2;
   }
 
   _MapBounds? _boundsForMapPolys(List<_MapPoly> polys) {
@@ -1663,6 +1842,32 @@ class _HomeScreenState extends State<HomeScreen>
         ? 0
         : (predicted.reduce((a, b) => a + b) / predicted.length).round();
 
+    DateTime? lastMeasureDay;
+    DateTime? lastMeasureAt;
+    for (final r in included) {
+      if (r.lastAt == null) continue;
+      final d = calendarDay(r.lastAt!);
+      if (lastMeasureDay == null ||
+          d.isAfter(lastMeasureDay) ||
+          (d == lastMeasureDay && r.lastAt!.isAfter(lastMeasureAt!))) {
+        lastMeasureDay = d;
+        lastMeasureAt = r.lastAt;
+      }
+    }
+    final measuredCovers = <int>[];
+    if (lastMeasureDay != null) {
+      for (final r in included) {
+        if (r.lastCover == null || r.lastAt == null) continue;
+        if (calendarDay(r.lastAt!) == lastMeasureDay) {
+          measuredCovers.add(r.lastCover!);
+        }
+      }
+    }
+    final measuredAvg = measuredCovers.isEmpty
+        ? null
+        : (measuredCovers.reduce((a, b) => a + b) / measuredCovers.length)
+            .round();
+
     final wedgePaddocks = included.where((r) => r.predicted > 0).map((r) {
       final m = RegExp(r'\d+').firstMatch(r.paddock.name);
       final label = m?.group(0) ?? '';
@@ -1718,7 +1923,11 @@ class _HomeScreenState extends State<HomeScreen>
           ),
         ),
         const SizedBox(height: 12),
-        _summaryCards(avgCover: avgCover),
+        _summaryCards(
+          avgCover: avgCover,
+          measuredAvg: measuredAvg,
+          measuredAt: lastMeasureAt,
+        ),
         const SizedBox(height: 12),
         _FeedWedge(
           paddocks: wedgePaddocks,
@@ -1735,215 +1944,584 @@ class _HomeScreenState extends State<HomeScreen>
 
   Widget _summaryUnderWedgeWidgets() {
     return FutureBuilder<List<dynamic>>(
-      future: Future.wait([
-        storage.loadCowCount(),
-        storage.loadAreaGrazedPerDayHa(),
+      future: _summaryWedgeFuture ??= Future.wait([
+        storage.loadHerds(),
         storage.loadPaddocks(),
         storage.loadAllGrazings(),
       ]),
       builder: (context, snap) {
         final data = snap.data;
 
-        final cowCount = (data != null && data.isNotEmpty)
-            ? (data[0] as int)
-            : 0;
-        final targetAreaPerDay = (data != null && data.length > 1)
-            ? (data[1] as double)
-            : 0.0;
-        final paddocks = (data != null && data.length > 2)
-            ? (data[2] as List<Paddock>)
+        final herds = (data != null && data.isNotEmpty)
+            ? (data[0] as List<Herd>)
+            : <Herd>[];
+        final paddocks = (data != null && data.length > 1)
+            ? (data[1] as List<Paddock>)
             : <Paddock>[];
-        final grazings = (data != null && data.length > 3)
-            ? (data[3] as List<Grazing>)
+        final grazings = (data != null && data.length > 2)
+            ? (data[2] as List<Grazing>)
             : <Grazing>[];
 
         final pById = {for (final p in paddocks) p.id: p};
+        final totalAreaPerDay = Storage.totalAreaGrazedPerDayHa(herds);
 
         final now = DateTime.now();
-        final start = DateTime(
-          now.year,
-          now.month,
-          now.day,
-        ).subtract(const Duration(days: 6));
-
-        final grazingsWeek = grazings.where((g) {
-          final d = DateTime(g.at.year, g.at.month, g.at.day);
-          return !d.isBefore(start) && !d.isAfter(now);
-        }).toList();
-
-        final harvestedWeek = grazingsWeek.fold<int>(
-          0,
-          (sum, g) => sum + g.harvestedKgDm,
-        );
-
-        final kgDmCowDay = (cowCount <= 0)
-            ? null
-            : harvestedWeek / cowCount / 7.0;
+        final today = DateTime(now.year, now.month, now.day);
+        final start = today.subtract(const Duration(days: 6));
 
         double areaWeek = 0.0;
-        for (final g in grazingsWeek) {
+        var harvestedWeek = 0;
+        for (final g in grazings) {
+          if (g.at.isAfter(now)) continue;
           final p = pById[g.paddockId];
-          if (p == null) continue;
-          if (!p.includeInRotation) continue;
-          areaWeek += p.areaHa;
+          if (p == null || !p.includeInRotation) continue;
+          forEachGrazingAllocationDay(
+            g.at,
+            g.durationDays,
+            areaHa: p.areaHa,
+            harvestedKgDm: g.harvestedKgDm.toDouble(),
+            fn: (day, area, harvest) {
+              if (day.isBefore(start) || day.isAfter(today)) return;
+              areaWeek += area;
+              harvestedWeek += harvest.round();
+            },
+          );
         }
         final actualAreaPerDay = areaWeek / 7.0;
 
-        final acc = (targetAreaPerDay <= 0)
+        final acc = (totalAreaPerDay <= 0)
             ? null
-            : (actualAreaPerDay / targetAreaPerDay);
+            : (actualAreaPerDay / totalAreaPerDay);
         final accPct = acc == null ? null : (acc * 100).clamp(0.0, 999.0);
 
-        return Row(
-          children: [
-            Expanded(
-              child: InkWell(
-                onTap: _editCowCount,
+        return IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
                 child: Card(
                   elevation: 0,
                   color: Colors.black.withValues(alpha: 0.04),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 10,
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'kgDM/cow/day',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.black54,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                          kgDmCowDay == null
-                              ? '—'
-                              : kgDmCowDay.toStringAsFixed(1),
-                          style: const TextStyle(
-                            fontSize: 22,
-                            fontWeight: FontWeight.w900,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          cowCount <= 0
-                              ? 'Tap to set cow numbers'
-                              : 'Using $cowCount cows (last 7d)',
-                          style: const TextStyle(
-                            fontSize: 11,
-                            color: Colors.black54,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ],
+                  child: SizedBox(
+                    height: 148,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                      child: StatefulBuilder(
+                        builder: (context, setLocal) {
+                          final page = herds.isEmpty
+                              ? 0
+                              : _herdFeedPage.clamp(0, herds.length - 1);
+                          return Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  const Expanded(
+                                    child: Text(
+                                      'kgDM/cow/day',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: Colors.black54,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ),
+                                  InkWell(
+                                    onTap: _editHerds,
+                                    child: const Padding(
+                                      padding: EdgeInsets.all(2),
+                                      child: Icon(
+                                        Icons.edit_outlined,
+                                        size: 16,
+                                        color: Colors.black45,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Expanded(
+                                child: herds.isEmpty
+                                    ? InkWell(
+                                        onTap: _editHerds,
+                                        child: const Align(
+                                          alignment: Alignment.centerLeft,
+                                          child: Text(
+                                            'Tap edit to add herds',
+                                            style: TextStyle(
+                                              fontSize: 12,
+                                              color: Colors.black54,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ),
+                                      )
+                                    : PageView.builder(
+                                        itemCount: herds.length,
+                                        onPageChanged: (i) {
+                                          _herdFeedPage = i;
+                                          setLocal(() {});
+                                        },
+                                        itemBuilder: (context, i) {
+                                          final h = herds[i];
+                                          final pasture = _kgDmCowDayForHerd(
+                                            herd: h,
+                                            totalAreaPerDay: totalAreaPerDay,
+                                            harvestedWeek: harvestedWeek,
+                                          );
+                                          final supp =
+                                              h.supplementKgDmPerCowPerDay;
+                                          final total = pasture == null
+                                              ? null
+                                              : pasture + supp;
+                                          String fmt(double? v) => v == null
+                                              ? '—'
+                                              : v.toStringAsFixed(1);
+                                          return Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                h.name,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: const TextStyle(
+                                                  fontSize: 13,
+                                                  fontWeight: FontWeight.w800,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 4),
+                                              _herdFeedLine(
+                                                'Pasture',
+                                                fmt(pasture),
+                                              ),
+                                              _herdFeedLine(
+                                                'Supplement',
+                                                fmt(supp),
+                                              ),
+                                              _herdFeedLine(
+                                                'Total',
+                                                fmt(total),
+                                                bold: true,
+                                              ),
+                                            ],
+                                          );
+                                        },
+                                      ),
+                              ),
+                              if (herds.length > 1)
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    for (var i = 0; i < herds.length; i++)
+                                      Container(
+                                        width: 6,
+                                        height: 6,
+                                        margin: const EdgeInsets.symmetric(
+                                          horizontal: 2,
+                                          vertical: 2,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          color: i == page
+                                              ? Colors.black87
+                                              : Colors.black26,
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                            ],
+                          );
+                        },
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: InkWell(
-                onTap: _editAreaGrazedPerDay,
-                child: Card(
-                  elevation: 0,
-                  color: Colors.black.withValues(alpha: 0.04),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 10,
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Grazing accuracy',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.black54,
-                            fontWeight: FontWeight.w700,
-                          ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: InkWell(
+                  onTap: () async {
+                    await Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => const GrazingAccuracyScreen(),
+                      ),
+                    );
+                    if (!mounted) return;
+                    await _refreshHome();
+                  },
+                  child: Card(
+                    elevation: 0,
+                    color: Colors.black.withValues(alpha: 0.04),
+                    child: SizedBox(
+                      height: 148,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Grazing accuracy',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.black54,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            if (totalAreaPerDay <= 0)
+                              const Expanded(
+                                child: Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(
+                                    'Set herd areas to track\nactual vs target ha/day',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.black54,
+                                      fontWeight: FontWeight.w600,
+                                      height: 1.3,
+                                    ),
+                                  ),
+                                ),
+                              )
+                            else ...[
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                children: [
+                                  Text(
+                                    '${(accPct ?? 0).toStringAsFixed(0)}%',
+                                    style: const TextStyle(
+                                      fontSize: 22,
+                                      fontWeight: FontWeight.w900,
+                                      height: 1,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Padding(
+                                      padding: const EdgeInsets.only(bottom: 4),
+                                      child: _AccuracyBar(
+                                        value: acc ?? 0.0,
+                                        enabled: true,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              _herdFeedLine(
+                                'Target',
+                                '${totalAreaPerDay.toStringAsFixed(2)} ha/d',
+                              ),
+                              _herdFeedLine(
+                                'Actual (7d)',
+                                '${actualAreaPerDay.toStringAsFixed(2)} ha/d',
+                              ),
+                              _herdFeedLine(
+                                'Difference',
+                                '${actualAreaPerDay >= totalAreaPerDay ? '+' : ''}${(actualAreaPerDay - totalAreaPerDay).toStringAsFixed(2)} ha/d',
+                                bold: true,
+                              ),
+                            ],
+                          ],
                         ),
-                        const SizedBox(height: 8),
-                        _AccuracyBar(
-                          value: acc ?? 0.0,
-                          enabled: targetAreaPerDay > 0,
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          targetAreaPerDay <= 0
-                              ? 'Tap to set target'
-                              : '${(accPct ?? 0).toStringAsFixed(0)}%  (actual ${actualAreaPerDay.toStringAsFixed(2)} ha/day vs target ${targetAreaPerDay.toStringAsFixed(2)})',
-                          style: const TextStyle(
-                            fontSize: 11,
-                            color: Colors.black54,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ],
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         );
       },
     );
   }
 
-  Future<void> _editCowCount() async {
-    final start = await storage.loadCowCount();
-    final ctrl = TextEditingController(text: start <= 0 ? '' : '$start');
-    if (!mounted) return;
+  double? _kgDmCowDayForHerd({
+    required Herd herd,
+    required double totalAreaPerDay,
+    required int harvestedWeek,
+  }) {
+    if (herd.cowCount <= 0 || totalAreaPerDay <= 0) return null;
+    final share = herd.areaGrazedPerDayHa / totalAreaPerDay;
+    return (harvestedWeek * share) / herd.cowCount / 7.0;
+  }
 
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Cow numbers'),
-        content: TextField(
-          controller: ctrl,
-          keyboardType: TextInputType.number,
-          decoration: const InputDecoration(
-            labelText: 'Number of cows',
-            border: OutlineInputBorder(),
+  Widget _herdFeedLine(String label, String value, {bool bold = false}) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 1),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 11,
+                color: Colors.black54,
+                fontWeight: bold ? FontWeight.w800 : FontWeight.w600,
+              ),
+            ),
           ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Save'),
+          Text(
+            value,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: bold ? FontWeight.w900 : FontWeight.w800,
+            ),
           ),
         ],
       ),
     );
+  }
 
-    if (ok != true) return;
+  Future<void> _editHerds() async {
+    final existing = await storage.loadHerds();
+    if (!mounted) return;
 
-    final t = ctrl.text.trim();
-    if (t.isEmpty) {
-      await storage.saveCowCount(0);
-      await _refreshHome();
-      return;
+    final drafts = existing
+        .map(
+          (h) => _HerdDraft(
+            id: h.id,
+            nameCtrl: TextEditingController(text: h.name),
+            cowsCtrl: TextEditingController(
+              text: h.cowCount <= 0 ? '' : '${h.cowCount}',
+            ),
+            areaCtrl: TextEditingController(
+              text: h.areaGrazedPerDayHa <= 0
+                  ? ''
+                  : h.areaGrazedPerDayHa.toStringAsFixed(2),
+            ),
+            suppCtrl: TextEditingController(
+              text: h.supplementKgDmPerCowPerDay <= 0
+                  ? ''
+                  : h.supplementKgDmPerCowPerDay.toStringAsFixed(1),
+            ),
+          ),
+        )
+        .toList();
+
+    if (drafts.isEmpty) {
+      drafts.add(
+        _HerdDraft(
+          id: 'herd_milkers',
+          nameCtrl: TextEditingController(text: 'Milkers'),
+          cowsCtrl: TextEditingController(),
+          areaCtrl: TextEditingController(),
+          suppCtrl: TextEditingController(),
+        ),
+      );
     }
 
-    final v = int.tryParse(t);
-    if (v == null) return;
-    await storage.saveCowCount(v);
+    List<Herd>? result;
+    try {
+      result = await showDialog<List<Herd>>(
+        context: context,
+        builder: (ctx) {
+          return StatefulBuilder(
+            builder: (ctx, setLocal) {
+              List<Herd>? parseDrafts() {
+                final saved = <Herd>[];
+                for (final d in drafts) {
+                  final name = d.nameCtrl.text.trim().isEmpty
+                      ? 'Herd'
+                      : d.nameCtrl.text.trim();
+                  final cowsText = d.cowsCtrl.text.trim();
+                  final areaText = d.areaCtrl.text.trim();
+                  final suppText = d.suppCtrl.text.trim();
+                  final cows =
+                      cowsText.isEmpty ? 0 : int.tryParse(cowsText);
+                  final area = areaText.isEmpty
+                      ? 0.0
+                      : double.tryParse(areaText);
+                  final supp = suppText.isEmpty
+                      ? 0.0
+                      : double.tryParse(suppText);
+                  if (cows == null ||
+                      cows < 0 ||
+                      area == null ||
+                      area < 0 ||
+                      supp == null ||
+                      supp < 0) {
+                    return null;
+                  }
+                  saved.add(
+                    Herd(
+                      id: d.id,
+                      name: name,
+                      cowCount: cows,
+                      areaGrazedPerDayHa: area,
+                      supplementKgDmPerCowPerDay: supp,
+                    ),
+                  );
+                }
+                return saved.isEmpty ? null : saved;
+              }
+
+              return AlertDialog(
+                title: const Text('Herds'),
+                content: SizedBox(
+                  width: double.maxFinite,
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxHeight: MediaQuery.sizeOf(ctx).height * 0.55,
+                    ),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          for (var i = 0; i < drafts.length; i++) ...[
+                            if (i > 0) const SizedBox(height: 12),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    'Herd ${i + 1}',
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w800,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                ),
+                                if (drafts.length > 1)
+                                  IconButton(
+                                    tooltip: 'Remove herd',
+                                    onPressed: () {
+                                      final removed = drafts.removeAt(i);
+                                      setLocal(() {});
+                                      WidgetsBinding.instance
+                                          .addPostFrameCallback((_) {
+                                        removed.dispose();
+                                      });
+                                    },
+                                    icon: const Icon(Icons.delete_outline),
+                                  ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            TextField(
+                              controller: drafts[i].nameCtrl,
+                              decoration: const InputDecoration(
+                                labelText: 'Name',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: drafts[i].cowsCtrl,
+                              keyboardType: TextInputType.number,
+                              decoration: const InputDecoration(
+                                labelText: 'Cows',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: drafts[i].areaCtrl,
+                              keyboardType:
+                                  const TextInputType.numberWithOptions(
+                                decimal: true,
+                              ),
+                              decoration: const InputDecoration(
+                                labelText: 'Area grazed (ha/day)',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: drafts[i].suppCtrl,
+                              keyboardType:
+                                  const TextInputType.numberWithOptions(
+                                decimal: true,
+                              ),
+                              decoration: const InputDecoration(
+                                labelText: 'Supplement (kgDM/cow/day)',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 12),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: TextButton.icon(
+                              onPressed: () {
+                                setLocal(() {
+                                  drafts.add(
+                                    _HerdDraft(
+                                      id:
+                                          'herd_${DateTime.now().millisecondsSinceEpoch}',
+                                      nameCtrl: TextEditingController(
+                                        text: drafts.any(
+                                              (d) =>
+                                                  d.nameCtrl.text
+                                                      .trim()
+                                                      .toLowerCase() ==
+                                                  'dry',
+                                            )
+                                            ? 'Herd ${drafts.length + 1}'
+                                            : 'Dry',
+                                      ),
+                                      cowsCtrl: TextEditingController(),
+                                      areaCtrl: TextEditingController(),
+                                      suppCtrl: TextEditingController(),
+                                    ),
+                                  );
+                                });
+                              },
+                              icon: const Icon(Icons.add),
+                              label: const Text('Add herd'),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text('Cancel'),
+                  ),
+                  ElevatedButton(
+                    onPressed: () {
+                      final saved = parseDrafts();
+                      if (saved == null) {
+                        ScaffoldMessenger.of(ctx).showSnackBar(
+                          const SnackBar(
+                            content: Text(
+                              'Check herd cows and area values.',
+                            ),
+                          ),
+                        );
+                        return;
+                      }
+                      Navigator.pop(ctx, saved);
+                    },
+                    child: const Text('Save'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+    } finally {
+      final toDispose = List<_HerdDraft>.from(drafts);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        for (final d in toDispose) {
+          d.dispose();
+        }
+      });
+    }
+
+    if (result == null || !mounted) return;
+    await storage.saveHerds(result);
+    if (!mounted) return;
     await _refreshHome();
   }
 
   Widget _summaryNotes() {
     return FutureBuilder<List<dynamic>>(
-      future: Future.wait([
+      future: _summaryNotesFuture ??= Future.wait([
         storage.loadAllNotes(),
         storage.loadHiddenSummaryNoteIds(),
         storage.loadPaddocks(),
@@ -2115,9 +2693,136 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  Widget _summaryCards({required int avgCover}) {
+  Widget _avgCoverSlide({
+    required String title,
+    required String value,
+    required String subtitle,
+  }) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            fontSize: 12,
+            height: 1.15,
+            color: Colors.black54,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          value,
+          style: const TextStyle(
+            fontSize: 22,
+            height: 1.15,
+            fontWeight: FontWeight.w900,
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          subtitle,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            fontSize: 11,
+            height: 1.15,
+            color: Colors.black54,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _avgCoverCard({
+    required int? measuredAvg,
+    required DateTime? measuredAt,
+    required int expectedAvg,
+  }) {
+    final now = DateTime.now();
+    final measuredLabel = measuredAt == null
+        ? 'No measurements'
+        : daysAgoLabel(now, measuredAt);
+    final measuredValue = measuredAvg?.toString() ?? '—';
+    final expectedValue = expectedAvg > 0 ? '$expectedAvg' : '—';
+
+    return InkWell(
+      onTap: () async {
+        await Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => const AvgCoverHistoryScreen()),
+        );
+      },
+      child: Card(
+        elevation: 0,
+        color: Colors.black.withValues(alpha: 0.04),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(
+            horizontal: 12,
+            vertical: 10,
+          ),
+          child: SizedBox(
+                height: 72,
+                child: Stack(
+                  clipBehavior: Clip.hardEdge,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.only(right: 18),
+                      child: PageView(
+                        children: [
+                          FittedBox(
+                            fit: BoxFit.scaleDown,
+                            alignment: Alignment.topLeft,
+                            child: _avgCoverSlide(
+                              title: 'Last measurement',
+                              value: measuredValue,
+                              subtitle: 'kgDM/ha · $measuredLabel',
+                            ),
+                          ),
+                          FittedBox(
+                            fit: BoxFit.scaleDown,
+                            alignment: Alignment.topLeft,
+                            child: _avgCoverSlide(
+                              title: 'Expected',
+                              value: expectedValue,
+                              subtitle: 'kgDM/ha · predicted',
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Positioned(
+                      right: -6,
+                      top: 0,
+                      bottom: 0,
+                      child: IgnorePointer(
+                        child: Center(
+                          child: Icon(
+                            Icons.chevron_right,
+                            size: 22,
+                            color: Colors.black38,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+        ),
+      ),
+    );
+  }
+
+  Widget _summaryCards({
+    required int avgCover,
+    required int? measuredAvg,
+    required DateTime? measuredAt,
+  }) {
     return FutureBuilder<List<dynamic>>(
-      future: Future.wait([
+      future: _summaryCardsFuture ??= Future.wait([
         storage.effectiveFarmGrowthKgDmPerHaPerDay(),
         storage.loadAreaGrazedPerDayHa(),
         storage.loadCoverTrendTimescale(),
@@ -2207,62 +2912,19 @@ class _HomeScreenState extends State<HomeScreen>
         return Column(
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Expanded(
-                  child: InkWell(
-                    onTap: () async {
-                      await Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => const AvgCoverHistoryScreen(),
-                        ),
-                      );
-                    },
-                    child: Card(
-                      elevation: 0,
-                      color: Colors.black.withValues(alpha: 0.04),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 10,
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'Avg cover',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Colors.black54,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const SizedBox(height: 6),
-                            Text(
-                              '$avgCover',
-                              style: const TextStyle(
-                                fontSize: 22,
-                                fontWeight: FontWeight.w900,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            const Text(
-                              'kgDM/ha',
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: Colors.black54,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
+                  child: _avgCoverCard(
+                    measuredAvg: measuredAvg,
+                    measuredAt: measuredAt,
+                    expectedAvg: avgCover,
                   ),
                 ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: InkWell(
-                    onTap: _editGrowth,
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: InkWell(
+                      onTap: _editGrowth,
                     child: Card(
                       elevation: 0,
                       color: Colors.black.withValues(alpha: 0.04),
@@ -2410,48 +3072,7 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _editAreaGrazedPerDay() async {
-    final start = await storage.loadAreaGrazedPerDayHa();
-    final ctrl = TextEditingController(
-      text: start <= 0 ? '' : start.toStringAsFixed(2),
-    );
-    if (!mounted) return;
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Area grazed per day'),
-        content: TextField(
-          controller: ctrl,
-          keyboardType: const TextInputType.numberWithOptions(decimal: true),
-          decoration: const InputDecoration(
-            labelText: 'ha/day',
-            border: OutlineInputBorder(),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-
-    if (ok != true) return;
-
-    final t = ctrl.text.trim();
-    if (t.isEmpty) {
-      await storage.saveAreaGrazedPerDayHa(0.0);
-      await _refreshHome();
-      return;
-    }
-    final v = double.tryParse(t);
-    if (v == null) return;
-    await storage.saveAreaGrazedPerDayHa(v);
-    await _refreshHome();
+    await _editHerds();
   }
 
   Future<void> _editTrendTimescale() async {
@@ -2606,434 +3227,38 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  /// All grazing events farm-wide: upcoming (soonest first), then past (newest first).
-  /// Tap a row to open that paddock’s history.
+  /// Farm-wide grazings on the shared calendar board (view until Edit).
   Widget _grazingsTab(List<_RowData> _) {
-    final nameById = {for (final p in paddocks) p.id: p.name};
-    final areaById = {for (final p in paddocks) p.id: p.areaHa};
-
-    return FutureBuilder<List<Grazing>>(
-      future: storage.loadAllGrazings(),
+    return FutureBuilder<({List<GrazingCalendarBlock> blocks, double target})>(
+      future: _ensureGrazingCalFuture(),
       builder: (context, snap) {
         if (!snap.hasData) {
           return const Center(child: CircularProgressIndicator());
         }
-        final now = DateTime.now();
-        final raw = snap.data!;
-        final upcoming = raw.where((g) => g.at.isAfter(now)).toList()
-          ..sort((a, b) => a.at.compareTo(b.at));
-        final past = raw.where((g) => !g.at.isAfter(now)).toList()
-          ..sort((a, b) => b.at.compareTo(a.at));
-        if (upcoming.isEmpty && past.isEmpty) {
-          return Center(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Text(
-                'No grazing events yet.',
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-            ),
-          );
-        }
+        final data = snap.data!;
+        final blocks = _grazingCalEdit
+            ? (_grazingCalWorking ?? data.blocks)
+            : data.blocks;
 
-        final cs = Theme.of(context).colorScheme;
-        final listChildren = <Widget>[];
-
-        void addGrazingRows(List<Grazing> list, bool isUpcoming) {
-          for (var i = 0; i < list.length; i++) {
-            final g = list[i];
-            final name = nameById[g.paddockId] ?? g.paddockId;
-            final area = areaById[g.paddockId] ?? 0.0;
-            final harv = area > 0
-                ? (g.harvestedKgDm / area).toStringAsFixed(0)
-                : '—';
-            Paddock? pdk;
-            for (final p in paddocks) {
-              if (p.id == g.paddockId) {
-                pdk = p;
-                break;
-              }
-            }
-            listChildren.add(
-              _grazingsFarmRow(
-                context: context,
-                colorScheme: cs,
-                g: g,
-                paddockName: name,
-                harvestPerHaText: harv,
-                isUpcoming: isUpcoming,
-                selectionMode: _grazingListSelectionMode,
-                isSelected: _selectedGrazingIds.contains(g.id),
-                onLongPress: () => _enterGrazingListSelectionMode(g.id),
-                onToggleSelected: () => _toggleGrazingListSelection(g.id),
-                onTap: () async {
-                  if (_grazingListSelectionMode) {
-                    _toggleGrazingListSelection(g.id);
-                    return;
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(6, 6, 6, 0),
+          child: GrazingCalendarBoard(
+            key: ValueKey('gcal_edit_$_grazingCalEdit'),
+            blocks: blocks,
+            targetHaDay: data.target,
+            interaction: _grazingCalEdit
+                ? GrazingCalendarInteraction.edit
+                : GrazingCalendarInteraction.view,
+            onBlocksChanged: _grazingCalEdit
+                ? (next) {
+                    setState(() => _grazingCalWorking = [...next]);
                   }
-                  if (pdk == null) return;
-                  await Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => PaddockHistoryScreen(paddock: pdk!),
-                    ),
-                  );
-                  await _refreshHome();
-                },
-                onRescheduleUpcoming: _grazingListSelectionMode
-                    ? null
-                    : isUpcoming
-                    ? () => _rescheduleUpcomingGrazing(g)
-                    : null,
-                onDeleteUpcoming: _grazingListSelectionMode
-                    ? null
-                    : isUpcoming
-                    ? () => _deleteSingleUpcomingGrazing(g)
-                    : null,
-              ),
-            );
-            if (i < list.length - 1) {
-              listChildren.add(const Divider(height: 1));
-            }
-          }
-        }
-
-        if (upcoming.isNotEmpty) {
-          listChildren.add(
-            _grazingsSectionHeader(
-              context,
-              cs,
-              'Upcoming',
-              trailing: _grazingListSelectionMode
-                  ? null
-                  : TextButton(
-                      onPressed: () => _deleteAllUpcomingGrazings(upcoming.length),
-                      style: TextButton.styleFrom(
-                        foregroundColor: Theme.of(context).colorScheme.error,
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                        minimumSize: Size.zero,
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      ),
-                      child: const Text('Delete all'),
-                    ),
-            ),
-          );
-          addGrazingRows(upcoming, true);
-        }
-        if (past.isNotEmpty) {
-          if (upcoming.isNotEmpty) {
-            listChildren.add(const Divider(height: 1));
-          }
-          listChildren.add(_grazingsSectionHeader(context, cs, 'Past'));
-          addGrazingRows(past, false);
-        }
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Container(
-              color: cs.surface,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              child: Row(
-                children: [
-                  if (_grazingListSelectionMode)
-                    const SizedBox(width: 40),
-                  SizedBox(
-                    width: 108,
-                    child: Text(
-                      'Date',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 12,
-                        color: cs.onSurfaceVariant,
-                      ),
-                    ),
-                  ),
-                  Expanded(
-                    flex: 2,
-                    child: Text(
-                      'Paddock',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 12,
-                        color: cs.onSurfaceVariant,
-                      ),
-                    ),
-                  ),
-                  SizedBox(
-                    width: 44,
-                    child: Text(
-                      'Pre',
-                      textAlign: TextAlign.end,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 11,
-                        color: cs.onSurfaceVariant,
-                      ),
-                    ),
-                  ),
-                  SizedBox(
-                    width: 44,
-                    child: Text(
-                      'Post',
-                      textAlign: TextAlign.end,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 11,
-                        color: cs.onSurfaceVariant,
-                      ),
-                    ),
-                  ),
-                  SizedBox(
-                    width: 48,
-                    child: Text(
-                      'Harv',
-                      textAlign: TextAlign.end,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 11,
-                        color: cs.onSurfaceVariant,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 48),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            Expanded(
-              child: ListView(
-                padding: EdgeInsets.zero,
-                children: listChildren,
-              ),
-            ),
-          ],
+                : null,
+            onBlockLongPress:
+                _grazingCalEdit ? _deleteGrazingCalBlock : null,
+          ),
         );
       },
-    );
-  }
-
-  Widget _grazingsSectionHeader(
-    BuildContext context,
-    ColorScheme cs,
-    String title, {
-    Widget? trailing,
-  }) {
-    return Container(
-      width: double.infinity,
-      color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(
-              title,
-              style: TextStyle(
-                fontWeight: FontWeight.w800,
-                fontSize: 12,
-                letterSpacing: 0.4,
-                color: cs.onSurfaceVariant,
-              ),
-            ),
-          ),
-          if (trailing != null) trailing,
-        ],
-      ),
-    );
-  }
-
-  Widget _grazingsFarmRow({
-    required BuildContext context,
-    required ColorScheme colorScheme,
-    required Grazing g,
-    required String paddockName,
-    required String harvestPerHaText,
-    required bool isUpcoming,
-    required bool selectionMode,
-    required bool isSelected,
-    required VoidCallback onLongPress,
-    required VoidCallback onToggleSelected,
-    required VoidCallback onTap,
-    Future<void> Function()? onRescheduleUpcoming,
-    Future<void> Function()? onDeleteUpcoming,
-  }) {
-    final dateCol = SizedBox(
-      width: 108,
-      child: isUpcoming
-          ? Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(
-                  Icons.schedule,
-                  size: 16,
-                  color: colorScheme.tertiary,
-                ),
-                const SizedBox(width: 4),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        DateFormat('d MMM yyyy').format(g.at),
-                        style: const TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      Text(
-                        'Scheduled',
-                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                              color: colorScheme.tertiary,
-                              fontWeight: FontWeight.w700,
-                            ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            )
-          : Text(
-              DateFormat('d MMM yyyy').format(g.at),
-              style: const TextStyle(fontSize: 13),
-            ),
-    );
-
-    final hasMenu = !selectionMode &&
-        isUpcoming &&
-        (onRescheduleUpcoming != null || onDeleteUpcoming != null);
-
-    final inner = Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      child: Row(
-        children: [
-          if (selectionMode)
-            SizedBox(
-              width: 28,
-              child: Checkbox(
-                value: isSelected,
-                onChanged: (_) => onToggleSelected(),
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                visualDensity: VisualDensity.compact,
-              ),
-            ),
-          dateCol,
-          Expanded(
-            child: Row(
-              children: [
-                Expanded(
-                  flex: 2,
-                  child: Text(
-                    paddockName,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-                SizedBox(
-                  width: 44,
-                  child: Text(
-                    '${g.preCover}',
-                    textAlign: TextAlign.end,
-                    style: const TextStyle(fontSize: 13),
-                  ),
-                ),
-                SizedBox(
-                  width: 44,
-                  child: Text(
-                    '${g.residual}',
-                    textAlign: TextAlign.end,
-                    style: const TextStyle(fontSize: 13),
-                  ),
-                ),
-                SizedBox(
-                  width: 48,
-                  child: Text(
-                    harvestPerHaText,
-                    textAlign: TextAlign.end,
-                    style: const TextStyle(fontSize: 13),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (hasMenu)
-            PopupMenuButton<String>(
-              padding: EdgeInsets.zero,
-              icon: Icon(
-                Icons.more_vert,
-                size: 22,
-                color: colorScheme.onSurfaceVariant,
-              ),
-              onSelected: (v) async {
-                if (v == 'r') await onRescheduleUpcoming?.call();
-                if (v == 'd') await onDeleteUpcoming?.call();
-              },
-              itemBuilder: (ctx) => [
-                const PopupMenuItem(
-                  value: 'r',
-                  child: ListTile(
-                    dense: true,
-                    leading: Icon(Icons.event_repeat_outlined),
-                    title: Text('Reschedule'),
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                ),
-                PopupMenuItem(
-                  value: 'd',
-                  child: ListTile(
-                    dense: true,
-                    leading: Icon(
-                      Icons.delete_outline,
-                      color: Theme.of(ctx).colorScheme.error,
-                    ),
-                    title: Text(
-                      'Delete',
-                      style: TextStyle(color: Theme.of(ctx).colorScheme.error),
-                    ),
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                ),
-              ],
-            )
-          else
-            const SizedBox(width: 48),
-        ],
-      ),
-    );
-
-    final decorated = isUpcoming
-        ? DecoratedBox(
-            decoration: BoxDecoration(
-              color: colorScheme.tertiaryContainer.withValues(alpha: 0.45),
-              border: Border(
-                left: BorderSide(color: colorScheme.tertiary, width: 3),
-              ),
-            ),
-            child: inner,
-          )
-        : inner;
-
-    final rowColor = selectionMode && isSelected
-        ? colorScheme.primaryContainer.withValues(alpha: 0.45)
-        : Colors.transparent;
-
-    return Material(
-      color: rowColor,
-      child: InkWell(
-        onTap: onTap,
-        onLongPress: () {
-          if (selectionMode) {
-            onToggleSelected();
-          } else {
-            onLongPress();
-          }
-        },
-        child: decorated,
-      ),
     );
   }
 
@@ -3278,6 +3503,29 @@ class _WedgePaddock {
   final String label;
   final int cover;
   const _WedgePaddock({required this.label, required this.cover});
+}
+
+class _HerdDraft {
+  final String id;
+  final TextEditingController nameCtrl;
+  final TextEditingController cowsCtrl;
+  final TextEditingController areaCtrl;
+  final TextEditingController suppCtrl;
+
+  _HerdDraft({
+    required this.id,
+    required this.nameCtrl,
+    required this.cowsCtrl,
+    required this.areaCtrl,
+    required this.suppCtrl,
+  });
+
+  void dispose() {
+    nameCtrl.dispose();
+    cowsCtrl.dispose();
+    areaCtrl.dispose();
+    suppCtrl.dispose();
+  }
 }
 
 class _FeedWedge extends StatelessWidget {

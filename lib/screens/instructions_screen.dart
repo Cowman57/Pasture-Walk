@@ -42,7 +42,9 @@ class InstructionsScreen extends StatelessWidget {
           _H2('Summary tab'),
           _Bullets([
             'Shows farm KPIs, the feed wedge, and recent notes.',
-            'Average cover uses included paddocks only.',
+            'Swipe Avg cover: last walk (actual covers + days since) or expected from predicted covers. Tap the card for history.',
+            'Herds (e.g. Milkers, Dry): each has cows, area grazed/day, and optional supplement kgDM/cow/day. Swipe the kgDM/cow/day card for each herd (pasture / supplement / total). Round length uses the sum of herd areas.',
+            'Tap Grazing accuracy for history (default: last 7 days + planned). Stacked daily paddock bars (area or harvest) colour green below target and red/orange above. Target changes are stored for the orange line. Edit herds via the pencil on kgDM/cow/day.',
             'You can clear notes from the Summary list (notes remain in paddock history).',
           ]),
           _H2('Paddocks tab'),
@@ -54,9 +56,9 @@ class InstructionsScreen extends StatelessWidget {
           ]),
           _H2('Grazings tab'),
           _Bullets([
-            'Lists farm-wide grazings in two sections: Upcoming (soonest first) and Past (newest first).',
-            'Future-dated (scheduled) grazings show a Scheduled label and tinted row so they stand out from past events.',
-            'Tap a row to open that paddock’s history. Use ⋮ on an upcoming row to reschedule or delete that scheduled event; use Delete all on the Upcoming header to clear every future grazing at once.',
+            'Calendar of past and upcoming grazings (scroll up/down). Day column shows % of herd target ha/day (green ≤100%, red over).',
+            'View-only until Edit. Tap a paddock to select it for adjustment, then drag it up/down to snap between days; drag the bottom handle to extend duration; × to delete. Unselected paddocks scroll with the calendar.',
+            'Scheduling new grazings from Paddocks uses the same board as a draft (Confirm & Save).',
           ]),
           _H2('Map tab'),
           _Bullets([
@@ -80,7 +82,7 @@ class InstructionsScreen extends StatelessWidget {
 
           _H1('5) Enter grazings'),
           _P(
-            'From Home → Paddocks tab, long-press a paddock to enter selection mode, select one or more paddocks, set the residual, then Save grazing.',
+            'From Home → Paddocks tab, long-press a paddock to enter selection mode, select one or more paddocks, set the residual, then Preview. The schedule board is a draft of the same calendar used on the Grazings tab — tap a draft block to select it, then drag between days or resize the bottom edge, then Confirm & Save. On Grazings, browse in view mode; tap Edit, tap a paddock to adjust, then Save.',
           ),
           _Bullets([
             'Pre cover is the paddock’s predicted cover at the time you save the grazing.',
