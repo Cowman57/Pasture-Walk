@@ -3545,6 +3545,25 @@ class _FeedWedge extends StatelessWidget {
         .where((p) => p.includeInRotation)
         .map((p) => p.id)
         .toSet();
+
+    final now = DateTime.now();
+    final allGrazings = await storage.loadAllGrazings();
+    final scheduled = allGrazings.where(
+      (g) => includedIds.contains(g.paddockId) && g.at.isAfter(now),
+    ).toList();
+
+    if (scheduled.isNotEmpty) {
+      final avgPre = (scheduled
+              .map((g) => g.preCover)
+              .reduce((a, b) => a + b) /
+          scheduled.length).round();
+      final avgPost = (scheduled
+              .map((g) => g.residual)
+              .reduce((a, b) => a + b) /
+          scheduled.length).round();
+      return (avgPre: avgPre, avgPost: avgPost);
+    }
+
     final avg = await storage.avgGrazingPrePostLastDays(
       days: 7,
       includedPaddockIds: includedIds,
@@ -3565,8 +3584,8 @@ class _FeedWedge extends StatelessWidget {
       text: (postOverride ?? auto.avgPost)?.toString() ?? '',
     );
     final autoLabel = (auto.avgPre != null && auto.avgPost != null)
-        ? 'Auto from last 7 days: ${auto.avgPre} → ${auto.avgPost}'
-        : 'Auto: no grazings in last 7 days';
+        ? 'Auto: ${auto.avgPre} → ${auto.avgPost}'
+        : 'Auto: no grazings available';
 
     final result = await showDialog<String>(
       context: context,
