@@ -257,6 +257,8 @@ class _MapPoly {
   final List<List<ll.LatLng>> rings;
   final _MapBounds bounds;
   final ll.LatLng centroid;
+  final bool isSilage;
+  final bool shutForSilage;
 
   const _MapPoly({
     required this.paddockId,
@@ -269,6 +271,8 @@ class _MapPoly {
     required this.rings,
     required this.bounds,
     required this.centroid,
+    required this.isSilage,
+    required this.shutForSilage,
   });
 }
 
@@ -621,11 +625,13 @@ class _HomeScreenState extends State<HomeScreen>
     final batch = await Future.wait([
       storage.loadAllMeasurements(),
       storage.loadAllGrazings(),
+      storage.loadAllSilageCuts(),
       storage.loadAllNotes(),
     ]);
     final msAll = batch[0] as List<Measurement>;
     final gsAll = batch[1] as List<Grazing>;
-    final notesAll = batch[2] as List<NoteEntry>;
+    final silageCutsAll = batch[2] as List<SilageCut>;
+    final notesAll = batch[3] as List<NoteEntry>;
 
     final includedIds = paddocks
         .where((p) => p.includeInRotation)
@@ -674,33 +680,27 @@ class _HomeScreenState extends State<HomeScreen>
           lastG != null && DateTime.now().difference(lastG.at).inDays < 3;
 
       final isExcluded = !p.includeInRotation;
-      final recordedCover = isExcluded ? null : lastCoverM?.cover;
-      final recordedAt = isExcluded ? null : lastCoverM?.at;
+      // For paddocks shut for silage, still show recorded covers
+      final recordedCover = (isExcluded && !p.shutForSilage) ? null : lastCoverM?.cover;
+      final recordedAt = (isExcluded && !p.shutForSilage) ? null : lastCoverM?.at;
 
       int predicted;
 
       // Cropped paddocks: predicted cover should be 0 so sorting doesn't float them up at 2500
-      if (!p.includeInRotation) {
+      // But for paddocks shut for silage, still calculate predicted cover
+      if (!p.includeInRotation && !p.shutForSilage) {
         predicted = 0;
       } else {
-        // Latest anchor = last measurement OR last grazing residual
-        final lastM = lastCoverM;
-        final baseAt = (lastM == null && lastG == null)
-            ? null
-            : (lastM != null && lastG == null)
-            ? lastM.at
-            : (lastG != null && lastM == null)
-            ? lastG.at
-            : (lastM!.at.isAfter(lastG!.at) ? lastM.at : lastG.at);
-        final baseCover = (lastM == null && lastG == null)
-            ? 2500
-            : (lastM != null && lastG == null)
-            ? lastM.cover
-            : (lastG != null && lastM == null)
-            ? lastG.residual
-            : (lastM!.at.isAfter(lastG!.at) ? lastM.cover : lastG.residual);
-        final days = baseAt == null ? 0 : now.difference(baseAt).inDays;
-
+        // Use proper anchor calculation that considers measurements, grazings, and silage cuts
+        final anchor = Storage.latestAnchorFromLists(
+          msAll,
+          gsAll,
+          silageCutsAll,
+          p.id,
+          now,
+        );
+        final baseCover = anchor?.coverKgDmHa ?? 2500;
+        final days = anchor == null ? 0 : now.difference(anchor.at).inDays;
         predicted = clampCover(baseCover + (days * farmGrowth).round());
       }
 
@@ -837,12 +837,30 @@ class _HomeScreenState extends State<HomeScreen>
 
   Widget _grazingBar(List<_RowData> rows) {
     final areaHa = _selectedAreaHa(rows);
+    final selectedRows = rows
+        .where((r) => selectedPaddockIds.contains(r.paddock.id))
+        .toList();
+    final anyShutForSilage = selectedRows
+        .any((r) => r.paddock.shutForSilage);
+    final allShutForSilage = selectedRows.isNotEmpty &&
+        selectedRows.every((r) => r.paddock.shutForSilage);
+    
     return _GrazingBar(
       residual: residual,
       selectedCount: selectedPaddockIds.length,
       selectedAreaHa: areaHa,
+      anyShutForSilage: anyShutForSilage,
+      allShutForSilage: allShutForSilage,
+      selectedRows: selectedRows,
       onResidualChanged: (v) => setState(() => residual = clampCover(v)),
       onUndo: selectedPaddockIds.isEmpty ? null : _undoGrazing,
+      onShutForSilage: selectedPaddockIds.isEmpty ? null : _shutForSilage,
+      onOpenForGrazing: (allShutForSilage && selectedPaddockIds.isNotEmpty) 
+          ? _openForGrazing 
+          : null,
+      onRecordCut: (allShutForSilage && selectedPaddockIds.isNotEmpty)
+          ? _recordSilageCut
+          : null,
       onPreview: selectedPaddockIds.isEmpty
           ? null
           : (range) async {
@@ -906,6 +924,270 @@ class _HomeScreenState extends State<HomeScreen>
       selectedPaddockIds.clear();
     });
 
+    await _refreshHome();
+  }
+
+  Future<void> _shutForSilage() async {
+    if (selectedPaddockIds.isEmpty) return;
+
+    // Show confirmation dialog explaining what will happen
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Shut paddocks for silage?'),
+        content: const Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('This will:'),
+            SizedBox(height: 8),
+            Text('• Exclude selected paddocks from rotation'),
+            Text('• Show tractor symbol on paddock screen'),
+            Text('• Allow recording silage cut later'),
+            Text('• Affects round length calculations'),
+            SizedBox(height: 12),
+            Text('Paddocks can be reopened for grazing or have silage cut recorded.'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.amber.shade700,
+            ),
+            child: const Text('Shut for silage'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    // Mark paddocks as shut for silage
+    final paddocks = await storage.loadPaddocks();
+    final updated = <Paddock>[];
+    for (final p in paddocks) {
+      if (selectedPaddockIds.contains(p.id)) {
+        updated.add(Paddock(
+          id: p.id,
+          name: p.name,
+          areaHa: p.areaHa,
+          recordOrder: p.recordOrder,
+          includeInRotation: false, // Exclude from rotation
+          isSilage: p.isSilage,
+          shutForSilage: true, // Mark as shut for silage
+        ));
+      } else {
+        updated.add(p);
+      }
+    }
+
+    await storage.savePaddocks(updated);
+
+    // Add to activity log
+    final note = 'Shut ${selectedPaddockIds.length} paddock${selectedPaddockIds.length == 1 ? '' : 's'} for silage';
+    await storage.appendNote(NoteEntry(
+      id: const Uuid().v4(),
+      paddockId: '', // Farm-wide note
+      at: DateTime.now(),
+      title: note,
+    ));
+
+    _resetGrazingBarDrop();
+    setState(() {
+      selectionMode = false;
+      selectedPaddockIds.clear();
+    });
+    await _refreshHome();
+  }
+
+  Future<void> _openForGrazing() async {
+    if (selectedPaddockIds.isEmpty) return;
+
+    // Reopen paddocks for grazing
+    final paddocks = await storage.loadPaddocks();
+    final updated = <Paddock>[];
+    for (final p in paddocks) {
+      if (selectedPaddockIds.contains(p.id)) {
+        updated.add(Paddock(
+          id: p.id,
+          name: p.name,
+          areaHa: p.areaHa,
+          recordOrder: p.recordOrder,
+          includeInRotation: true, // Include in rotation
+          isSilage: p.isSilage,
+          shutForSilage: false, // No longer shut for silage
+        ));
+      } else {
+        updated.add(p);
+      }
+    }
+
+    await storage.savePaddocks(updated);
+
+    // Add to activity log
+    final note = 'Opened ${selectedPaddockIds.length} paddock${selectedPaddockIds.length == 1 ? '' : 's'} for grazing';
+    await storage.appendNote(NoteEntry(
+      id: const Uuid().v4(),
+      paddockId: '', // Farm-wide note
+      at: DateTime.now(),
+      title: note,
+    ));
+
+    _resetGrazingBarDrop();
+    setState(() {
+      selectionMode = false;
+      selectedPaddockIds.clear();
+    });
+    await _refreshHome();
+  }
+
+  Future<void> _recordSilageCut() async {
+    if (selectedPaddockIds.isEmpty) return;
+
+    // Show dialog to record silage cut details
+    final residualCtrl = TextEditingController(text: '1200'); // Default residual
+    var cutDate = DateTime.now();
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setState) => AlertDialog(
+          title: const Text('Record silage cut'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('This will record a silage cut for selected paddocks.'),
+                const SizedBox(height: 12),
+                Text('Cut date: ${DateFormat('d MMM yyyy').format(cutDate)}'),
+                TextButton(
+                  onPressed: () async {
+                    final picked = await showDatePicker(
+                      context: context,
+                      initialDate: cutDate,
+                      firstDate: DateTime(2000),
+                      lastDate: DateTime(2100),
+                    );
+                    if (picked != null) {
+                      setState(() => cutDate = picked);
+                    }
+                  },
+                  child: const Text('Change date'),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: residualCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Residual after cut (kgDM/ha)',
+                  ),
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Pre-cut cover will be taken from predicted cover. Harvest will be calculated from predicted cover minus residual.',
+                  style: TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.amber.shade700,
+              ),
+              child: const Text('Record cut'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    final residual = int.tryParse(residualCtrl.text.trim()) ?? 1200;
+    final clampedResidual = clampCover(residual);
+
+    // Get current rows to access predicted cover
+    final rows = await _rowsFuture;
+    if (rows == null) return;
+    final selectedRows = rows
+        .where((r) => selectedPaddockIds.contains(r.paddock.id))
+        .toList();
+
+    // Record silage cut for each selected paddock
+    for (final row in selectedRows) {
+      final predicted = row.predicted;
+      final preCover = predicted > 0 ? predicted : 2000; // Fallback
+      final area = row.paddock.areaHa;
+      final harvested = area > 0 
+          ? ((preCover - clampedResidual) * area).round().clamp(0, 999999999)
+          : 0;
+
+      // Create silage cut record
+      final silageCutId = const Uuid().v4();
+      await storage.appendSilageCut(SilageCut(
+        id: silageCutId,
+        paddockId: row.paddock.id,
+        at: cutDate,
+        preCover: preCover,
+        residual: clampedResidual,
+        harvestedKgDm: harvested,
+      ));
+
+      // Reopen paddock for grazing (automatically reincluded)
+      final paddocks = await storage.loadPaddocks();
+      final updated = <Paddock>[];
+      for (final p in paddocks) {
+        if (p.id == row.paddock.id) {
+          updated.add(Paddock(
+            id: p.id,
+            name: p.name,
+            areaHa: p.areaHa,
+            recordOrder: p.recordOrder,
+            includeInRotation: true, // Reincluded in rotation
+            isSilage: p.isSilage,
+            shutForSilage: false, // No longer shut for silage
+          ));
+        } else {
+          updated.add(p);
+        }
+      }
+      await storage.savePaddocks(updated);
+    }
+
+    // Add to activity log with summary
+    final totalArea = selectedRows.fold(0.0, (sum, r) => sum + r.paddock.areaHa);
+    final totalHarvest = selectedRows.fold(0, (sum, r) {
+      final predicted = r.predicted > 0 ? r.predicted : 2000;
+      final area = r.paddock.areaHa;
+      return sum + ((predicted - clampedResidual) * area).round();
+    });
+    final avgYield = totalArea > 0 ? totalHarvest / totalArea : 0;
+    final avgYieldRounded = avgYield.round();
+    final note = 'Silage cut: ${selectedPaddockIds.length} paddock${selectedPaddockIds.length == 1 ? '' : 's'}, ${totalArea.toStringAsFixed(1)} ha, $totalHarvest kgDM, $avgYieldRounded kgDM/ha avg';
+    await storage.appendNote(NoteEntry(
+      id: const Uuid().v4(),
+      paddockId: '', // Farm-wide note
+      at: DateTime.now(),
+      title: note,
+    ));
+
+    _resetGrazingBarDrop();
+    setState(() {
+      selectionMode = false;
+      selectedPaddockIds.clear();
+    });
     await _refreshHome();
   }
 
@@ -1374,9 +1656,13 @@ class _HomeScreenState extends State<HomeScreen>
                                 ? 3.2
                                 : (futureBorder ? 2.8 : 1.6),
                             isFilled: true,
-                            color: p.excluded
-                                ? Colors.grey.withValues(alpha: 0.25)
-                                : c.withValues(alpha: sel ? 0.95 : 0.90),
+color: p.shutForSilage
+      ? Colors.orange.withValues(alpha: 0.35)
+      : (p.isSilage
+          ? Colors.amber.withValues(alpha: 0.35)
+          : (p.excluded
+              ? Colors.grey.withValues(alpha: 0.25)
+              : c.withValues(alpha: sel ? 0.95 : 0.90))),
                           );
                         }).toList(),
                       ),
@@ -1491,6 +1777,90 @@ class _HomeScreenState extends State<HomeScreen>
                                           height: 1.0,
                                           color: Colors.blue.shade800,
                                         ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }
+
+                            if (p.shutForSilage && show3) {
+                              out.add(
+                                Marker(
+                                  point: p.centroid,
+                                  width: 22,
+                                  height: 22,
+                                  alignment: Alignment.bottomRight,
+                                  child: Transform.translate(
+                                    offset: const Offset(18, 16),
+                                    child: Container(
+                                      width: 22,
+                                      height: 22,
+                                      decoration: BoxDecoration(
+                                        color: Colors.white.withValues(
+                                          alpha: 0.92,
+                                        ),
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(
+                                          color: Colors.orange.withValues(
+                                            alpha: 0.45,
+                                          ),
+                                        ),
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: Colors.black.withValues(
+                                              alpha: 0.10,
+                                            ),
+                                            blurRadius: 6,
+                                            offset: const Offset(0, 2),
+                                          ),
+                                        ],
+                                      ),
+                                      child: Icon(
+                                        Icons.agriculture,
+                                        size: 16,
+                                        color: Colors.orange.shade800,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            } else if (p.isSilage && show3) {
+                              out.add(
+                                Marker(
+                                  point: p.centroid,
+                                  width: 22,
+                                  height: 22,
+                                  alignment: Alignment.bottomRight,
+                                  child: Transform.translate(
+                                    offset: const Offset(18, 16),
+                                    child: Container(
+                                      width: 22,
+                                      height: 22,
+                                      decoration: BoxDecoration(
+                                        color: Colors.white.withValues(
+                                          alpha: 0.92,
+                                        ),
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(
+                                          color: Colors.amber.withValues(
+                                            alpha: 0.45,
+                                          ),
+                                        ),
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: Colors.black.withValues(
+                                              alpha: 0.10,
+                                            ),
+                                            blurRadius: 6,
+                                            offset: const Offset(0, 2),
+                                          ),
+                                        ],
+                                      ),
+                                      child: Icon(
+                                        Icons.grass,
+                                        size: 16,
+                                        color: Colors.amber.shade800,
                                       ),
                                     ),
                                   ),
@@ -1686,6 +2056,8 @@ class _HomeScreenState extends State<HomeScreen>
           rings: rings,
           bounds: bounds,
           centroid: centroid,
+          isSilage: row.paddock.isSilage,
+          shutForSilage: row.paddock.shutForSilage,
         ),
       );
     }
@@ -1831,7 +2203,7 @@ class _HomeScreenState extends State<HomeScreen>
 
 
   Widget _summaryTab(List<_RowData> rows) {
-    final included = rows.where((r) => r.paddock.includeInRotation).toList();
+    final included = rows.where((r) => r.paddock.includeInRotation && !r.paddock.isSilage).toList();
     included.sort((a, b) => b.predicted.compareTo(a.predicted));
 
     final predicted = included
@@ -2848,12 +3220,12 @@ class _HomeScreenState extends State<HomeScreen>
             : <Grazing>[];
 
         final includedIds = allPaddocks
-            .where((p) => p.includeInRotation)
+            .where((p) => p.includeInRotation && !p.isSilage)
             .map((p) => p.id)
             .toSet();
 
         final includedArea = allPaddocks
-            .where((p) => p.includeInRotation)
+            .where((p) => p.includeInRotation && !p.isSilage)
             .fold<double>(0.0, (sum, p) => sum + p.areaHa);
 
         final roundLengthDays = (areaPerDay > 0 && includedArea > 0)
@@ -3193,7 +3565,7 @@ class _HomeScreenState extends State<HomeScreen>
           curve: Curves.easeOutCubic,
         ),
         axis: Axis.vertical,
-        axisAlignment: -1,
+        alignment: Alignment.topCenter,
         child: child,
       ),
     );
@@ -3352,15 +3724,17 @@ class _HomeScreenState extends State<HomeScreen>
         ? 0.0
         : ((clamped - minCoverBar) / denom);
 
-    // ✅ Prev line becomes "Excluded" when cropped
-    final prevText = isExcluded
-        ? 'Excluded'
-        : (r.lastAt == null
-              ? 'Prev —'
-              : 'Prev ${daysAgoLabel(now, r.lastAt!)}');
+    // ✅ Prev line becomes "Excluded" when cropped OR "Silage" when shut for silage
+    final prevText = r.paddock.shutForSilage
+        ? 'Silage'
+        : (isExcluded
+            ? 'Excluded'
+            : (r.lastAt == null
+                ? 'Prev —'
+                : 'Prev ${daysAgoLabel(now, r.lastAt!)}'));
 
-    // ✅ Grey out if grazed OR excluded
-    final rowGreyed = r.grazed || isExcluded;
+    // ✅ Grey out if grazed OR excluded (but NOT if shut for silage)
+    final rowGreyed = r.grazed || (isExcluded && !r.paddock.shutForSilage);
 
     final isSelected = selectedPaddockIds.contains(r.paddock.id);
     final bg = selectionMode && isSelected
@@ -3409,8 +3783,12 @@ class _HomeScreenState extends State<HomeScreen>
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         // ✅ excluded red symbol (takes priority visually)
-                        if (isExcluded)
+                        if (isExcluded && !r.paddock.shutForSilage)
                           const Icon(Icons.block, size: 16, color: Colors.red),
+
+                        // tractor symbol for paddocks shut for silage
+                        if (r.paddock.shutForSilage)
+                          const Icon(Icons.agriculture, size: 16, color: Colors.amber),
 
                         // grazed symbol
                         if (!isExcluded && r.grazed)
@@ -3542,7 +3920,7 @@ class _FeedWedge extends StatelessWidget {
   Future<({int? avgPre, int? avgPost})> _autoPrePost() async {
     final paddocksAll = await storage.loadPaddocks();
     final includedIds = paddocksAll
-        .where((p) => p.includeInRotation)
+        .where((p) => p.includeInRotation && !p.isSilage)
         .map((p) => p.id)
         .toSet();
 
@@ -3893,16 +4271,28 @@ class _GrazingBar extends StatefulWidget {
   final int residual;
   final int selectedCount;
   final double selectedAreaHa;
+  final bool anyShutForSilage;
+  final bool allShutForSilage;
+  final List<_RowData> selectedRows;
   final ValueChanged<int> onResidualChanged;
   final VoidCallback? onUndo;
+  final VoidCallback? onShutForSilage;
+  final VoidCallback? onOpenForGrazing;
+  final VoidCallback? onRecordCut;
   final ValueChanged<DateTimeRange>? onPreview;
 
   const _GrazingBar({
     required this.residual,
     required this.selectedCount,
     this.selectedAreaHa = 0,
+    required this.anyShutForSilage,
+    required this.allShutForSilage,
+    required this.selectedRows,
     required this.onResidualChanged,
     required this.onUndo,
+    required this.onShutForSilage,
+    required this.onOpenForGrazing,
+    required this.onRecordCut,
     required this.onPreview,
   });
 
@@ -4088,35 +4478,111 @@ class _GrazingBarState extends State<_GrazingBar> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               mainAxisSize: MainAxisSize.min,
               children: [
-                SizedBox(
-                  height: 44,
-                  child: OutlinedButton(
-                    onPressed: widget.onUndo,
-                    child: const Text(
-                      'Undo grazing',
-                      overflow: TextOverflow.ellipsis,
-                      maxLines: 1,
-                      textAlign: TextAlign.center,
+                if (widget.allShutForSilage) ...[
+                  // Paddocks are shut for silage - show "Open for grazing" and "Record cut"
+                  SizedBox(
+                    height: 44,
+                    child: OutlinedButton(
+                      onPressed: widget.onOpenForGrazing,
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.green.shade800,
+                      ),
+                      child: const Text(
+                        'Open for grazing',
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        textAlign: TextAlign.center,
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(height: 8),
-                SizedBox(
-                  height: 48,
-                  child: ElevatedButton(
-                    onPressed: (widget.onPreview == null || _range == null)
-                        ? null
-                        : () => widget.onPreview!(_range!),
-                    child: Text(
-                      widget.selectedAreaHa > 0
-                          ? 'Preview (${widget.selectedCount}) · ${widget.selectedAreaHa.toStringAsFixed(1)} ha'
-                          : 'Preview (${widget.selectedCount})',
-                      overflow: TextOverflow.ellipsis,
-                      maxLines: 2,
-                      textAlign: TextAlign.center,
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: 48,
+                    child: ElevatedButton(
+                      onPressed: widget.onRecordCut,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.amber.shade700,
+                      ),
+                      child: const Text(
+                        'Record silage cut',
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                      ),
                     ),
                   ),
-                ),
+                ] else if (widget.anyShutForSilage) ...[
+                  // Mixed selection - show warning
+                  SizedBox(
+                    height: 48,
+                    child: OutlinedButton(
+                      onPressed: null,
+                      child: Text(
+                        'Mixed selection',
+                        style: TextStyle(color: Colors.orange.shade800),
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Select only silage or only non-silage paddocks',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.orange.shade800,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                ] else ...[
+                  // Normal paddocks - show "Undo grazing" and "Preview" / "Shut for silage"
+                  SizedBox(
+                    height: 44,
+                    child: OutlinedButton(
+                      onPressed: widget.onUndo,
+                      child: const Text(
+                        'Undo grazing',
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: 48,
+                    child: ElevatedButton(
+                      onPressed: widget.onShutForSilage,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.amber.shade600,
+                      ),
+                      child: const Text(
+                        'Shut for silage',
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: 48,
+                    child: ElevatedButton(
+                      onPressed: (widget.onPreview == null || _range == null)
+                          ? null
+                          : () => widget.onPreview!(_range!),
+                      child: Text(
+                        widget.selectedAreaHa > 0
+                            ? 'Preview (${widget.selectedCount}) · ${widget.selectedAreaHa.toStringAsFixed(1)} ha'
+                            : 'Preview (${widget.selectedCount})',
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
           ),

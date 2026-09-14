@@ -14,7 +14,7 @@ class ActivityLogScreen extends StatefulWidget {
   State<ActivityLogScreen> createState() => _ActivityLogScreenState();
 }
 
-enum _LogKind { cover, grazing, note }
+enum _LogKind { cover, grazing, note, silageCut }
 
 /// How grazing rows are bucketed (past vs scheduled-by-entry-day).
 enum _GrazingBucket { pastEventDay, futureEnteredDay }
@@ -64,6 +64,8 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
         return 'Grazings';
       case _LogKind.note:
         return 'Notes';
+      case _LogKind.silageCut:
+        return 'Silage cuts';
     }
   }
 
@@ -75,6 +77,8 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
         return Icons.agriculture_outlined;
       case _LogKind.note:
         return Icons.note_alt_outlined;
+      case _LogKind.silageCut:
+        return Icons.grass;
     }
   }
 
@@ -84,8 +88,10 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
         return 0;
       case _LogKind.grazing:
         return g.grazingBucket == _GrazingBucket.futureEnteredDay ? 2 : 1;
-      case _LogKind.note:
+      case _LogKind.silageCut:
         return 3;
+      case _LogKind.note:
+        return 4;
     }
   }
 
@@ -93,6 +99,7 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
     List<Measurement> measurements,
     List<Grazing> grazings,
     List<NoteEntry> notes,
+    List<SilageCut> silageCuts,
     DateTime now,
   ) {
     final map = <String, _LogGroup>{};
@@ -127,6 +134,16 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
       g.paddockIds.add(x.paddockId);
     }
 
+    for (final s in silageCuts) {
+      final day = _dayLocal(s.at);
+      final g = map.putIfAbsent(
+        '${_LogKind.silageCut.name}_${day.year}_${day.month}_${day.day}',
+        () => _LogGroup(kind: _LogKind.silageCut, day: day),
+      );
+      g.ids.add(s.id);
+      g.paddockIds.add(s.paddockId);
+    }
+
     for (final n in notes) {
       final day = _dayLocal(n.at);
       final g = map.putIfAbsent(
@@ -157,6 +174,10 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
       case _LogKind.grazing:
         for (final id in g.ids) {
           await storage.deleteGrazingById(id);
+        }
+      case _LogKind.silageCut:
+        for (final id in g.ids) {
+          await storage.deleteSilageCutById(id);
         }
       case _LogKind.note:
         for (final id in g.ids) {
@@ -193,6 +214,8 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
         await storage.deleteMeasurementById(id);
       case _LogKind.grazing:
         await storage.deleteGrazingById(id);
+      case _LogKind.silageCut:
+        await storage.deleteSilageCutById(id);
       case _LogKind.note:
         await storage.deleteNoteById(id);
     }
@@ -214,13 +237,15 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
     final snap = await Future.wait([
       storage.loadAllMeasurements(),
       storage.loadAllGrazings(),
+      storage.loadAllSilageCuts(),
       storage.loadAllNotes(),
     ]);
     final measurements = snap[0] as List<Measurement>;
     final grazings = snap[1] as List<Grazing>;
-    final notes = snap[2] as List<NoteEntry>;
+    final silageCuts = snap[2] as List<SilageCut>;
+    final notes = snap[3] as List<NoteEntry>;
     final now = DateTime.now();
-    final groups = _buildGroups(measurements, grazings, notes, now);
+    final groups = _buildGroups(measurements, grazings, notes, silageCuts, now);
     final toDelete = groups.where((g) => _selectedKeys.contains(g.key)).toList();
 
     var totalEvents = 0;
@@ -285,6 +310,13 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
     return null;
   }
 
+  SilageCut? _sById(List<SilageCut> all, String id) {
+    for (final s in all) {
+      if (s.id == id) return s;
+    }
+    return null;
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -320,6 +352,7 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
         future: Future.wait([
           storage.loadAllMeasurements(),
           storage.loadAllGrazings(),
+          storage.loadAllSilageCuts(),
           storage.loadAllNotes(),
           storage.loadPaddocks(),
         ]),
@@ -329,12 +362,13 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
           }
           final measurements = snap.data![0] as List<Measurement>;
           final grazings = snap.data![1] as List<Grazing>;
-          final notes = snap.data![2] as List<NoteEntry>;
-          final paddocks = snap.data![3] as List<Paddock>;
+          final silageCuts = snap.data![2] as List<SilageCut>;
+          final notes = snap.data![3] as List<NoteEntry>;
+          final paddocks = snap.data![4] as List<Paddock>;
           final nameById = {for (final p in paddocks) p.id: p.name};
 
           final now = DateTime.now();
-          final groups = _buildGroups(measurements, grazings, notes, now);
+          final groups = _buildGroups(measurements, grazings, notes, silageCuts, now);
           if (groups.isEmpty) {
             return Center(
               child: Padding(
@@ -361,6 +395,7 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
                   measurements,
                   grazings,
                   notes,
+                  silageCuts,
                   nameById,
                   _onLongPressSelectGroup,
                 ),
@@ -378,6 +413,7 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
     List<Measurement> measurements,
     List<Grazing> grazings,
     List<NoteEntry> notes,
+    List<SilageCut> silageCuts,
     Map<String, String> nameById,
     void Function(String groupKey) onLongPressSelectGroup,
   ) {
@@ -401,6 +437,7 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
           measurements,
           grazings,
           notes,
+          silageCuts,
           nameById,
         ),
     ];
@@ -450,6 +487,7 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
     List<Measurement> measurements,
     List<Grazing> grazings,
     List<NoteEntry> notes,
+    List<SilageCut> silageCuts,
     Map<String, String> nameById,
   ) {
     String pad(String pid) => nameById[pid] ?? pid;
@@ -481,6 +519,20 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
             'Event ${_dateTimeFmt.format(x.at)}'
             '${x.at.isAfter(DateTime.now()) ? ' · entered ${_dateTimeFmt.format(x.enteredAt)}' : ''}',
           ),
+          trailing: IconButton(
+            icon: Icon(Icons.delete_outline, color: Theme.of(context).colorScheme.error),
+            onPressed: _selectionMode
+                ? null
+                : () => _deleteOne(kind: kind, id: id),
+          ),
+        );
+      case _LogKind.silageCut:
+        final s = _sById(silageCuts, id);
+        if (s == null) return const SizedBox.shrink();
+        return ListTile(
+          dense: true,
+          title: Text('Silage: ${s.preCover} → ${s.residual} kgDM/ha · ${pad(s.paddockId)}'),
+          subtitle: Text(_dateTimeFmt.format(s.at)),
           trailing: IconButton(
             icon: Icon(Icons.delete_outline, color: Theme.of(context).colorScheme.error),
             onPressed: _selectionMode

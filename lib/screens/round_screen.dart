@@ -271,6 +271,7 @@ class _RoundScreenState extends State<RoundScreen>
     final batch = await Future.wait<Object>([
       storage.loadAllMeasurements(),
       storage.loadAllGrazings(),
+      storage.loadAllSilageCuts(),
       storage.loadNoteButton1Title(),
       storage.loadNoteButton2Title(),
       storage.loadCoverStep(),
@@ -278,6 +279,7 @@ class _RoundScreenState extends State<RoundScreen>
 
     final allMeasurements = batch[0] as List<Measurement>;
     final allGrazings = batch[1] as List<Grazing>;
+    final allSilageCuts = batch[2] as List<SilageCut>;
     noteBtn1 = batch[2] as String;
     noteBtn2 = batch[3] as String;
     coverStep = batch[4] as int;
@@ -304,6 +306,7 @@ class _RoundScreenState extends State<RoundScreen>
       final anchor = Storage.latestAnchorFromLists(
         allMeasurements,
         allGrazings,
+        allSilageCuts,
         p.id,
         now,
       );

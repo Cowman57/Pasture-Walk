@@ -21,6 +21,8 @@ class Storage {
   static const _notesKey = 'notes';
   static const _hiddenSummaryNoteIdsKey = 'hidden_summary_note_ids';
 
+  static const _silageCutsKey = 'silage_cuts';
+
   // v2.0.0 Map/GPS keys
   static const _gpsMeasuringEnabledKey = 'gps_measuring_enabled';
   static const _farmMapSourceRawKey = 'farm_map_source_raw';
@@ -40,6 +42,8 @@ class Storage {
   static const _areaGrazedPerDayHaKey = 'area_grazed_per_day_ha';
   static const _coverTrendTimescaleKey = 'cover_trend_timescale';
   static const _cowCountKey = 'cow_count';
+  static const _herdsKey = 'herds_json';
+  static const _herdTargetHistoryKey = 'herd_target_history_json';
 
   // -----------------------------
   // SETTINGS
@@ -212,14 +216,28 @@ class Storage {
   }
 
   Future<double> loadAreaGrazedPerDayHa() async {
-    final sp = await SharedPreferences.getInstance();
-    return sp.getDouble(_areaGrazedPerDayHaKey) ?? 0.0;
+    final herds = await loadHerds();
+    return totalAreaGrazedPerDayHa(herds);
   }
 
   Future<void> saveAreaGrazedPerDayHa(double v) async {
-    final sp = await SharedPreferences.getInstance();
-    final safe = v.isFinite ? v : 0.0;
-    await sp.setDouble(_areaGrazedPerDayHaKey, safe.clamp(0.0, 999999999.0));
+    // Legacy single-value write: keep first herd (or create Milkers) in sync.
+    final safe = (v.isFinite ? v : 0.0).clamp(0.0, 999999999.0);
+    final herds = await loadHerds();
+    if (herds.isEmpty) {
+      await saveHerds([
+        Herd(
+          id: 'herd_milkers',
+          name: 'Milkers',
+          cowCount: await loadCowCount(),
+          areaGrazedPerDayHa: safe,
+        ),
+      ]);
+      return;
+    }
+    final updated = [...herds];
+    updated[0] = updated[0].copyWith(areaGrazedPerDayHa: safe);
+    await saveHerds(updated);
   }
 
   Future<String> loadCoverTrendTimescale() async {
@@ -236,15 +254,175 @@ class Storage {
   }
 
   Future<int> loadCowCount() async {
-    final sp = await SharedPreferences.getInstance();
-    final v = sp.getInt(_cowCountKey);
-    return (v == null || v < 0) ? 0 : v;
+    final herds = await loadHerds();
+    if (herds.isEmpty) {
+      final sp = await SharedPreferences.getInstance();
+      final v = sp.getInt(_cowCountKey);
+      return (v == null || v < 0) ? 0 : v;
+    }
+    return herds.fold<int>(0, (sum, h) => sum + h.cowCount);
   }
 
   Future<void> saveCowCount(int v) async {
-    final sp = await SharedPreferences.getInstance();
     final safe = v.clamp(0, 999999999);
-    await sp.setInt(_cowCountKey, safe);
+    final herds = await loadHerds();
+    if (herds.isEmpty) {
+      final sp = await SharedPreferences.getInstance();
+      await sp.setInt(_cowCountKey, safe);
+      return;
+    }
+    final updated = [...herds];
+    updated[0] = updated[0].copyWith(cowCount: safe);
+    await saveHerds(updated);
+  }
+
+  /// Named herds with per-herd cow count and area grazed/day.
+  /// Migrates once from legacy single cow_count + area_grazed_per_day_ha.
+  Future<List<Herd>> loadHerds() async {
+    final sp = await SharedPreferences.getInstance();
+    final raw = sp.getString(_herdsKey);
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final list = jsonDecode(raw) as List;
+        final herds = list
+            .whereType<Map>()
+            .map((e) => Herd.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+        if (herds.isNotEmpty) return herds;
+      } catch (_) {
+        // fall through to migrate
+      }
+    }
+
+    final legacyCows = sp.getInt(_cowCountKey) ?? 0;
+    final legacyArea = sp.getDouble(_areaGrazedPerDayHaKey) ?? 0.0;
+    final migrated = [
+      Herd(
+        id: 'herd_milkers',
+        name: 'Milkers',
+        cowCount: legacyCows < 0 ? 0 : legacyCows,
+        areaGrazedPerDayHa: legacyArea.isFinite
+            ? legacyArea.clamp(0.0, 999999999.0)
+            : 0.0,
+      ),
+    ];
+    await saveHerds(migrated);
+    return migrated;
+  }
+
+  Future<void> saveHerds(List<Herd> herds) async {
+    final sp = await SharedPreferences.getInstance();
+    final cleaned = herds
+        .map(
+          (h) => Herd(
+            id: h.id.trim().isEmpty
+                ? 'herd_${DateTime.now().millisecondsSinceEpoch}'
+                : h.id,
+            name: h.name.trim().isEmpty ? 'Herd' : h.name.trim(),
+            cowCount: h.cowCount.clamp(0, 999999999),
+            areaGrazedPerDayHa: h.areaGrazedPerDayHa.isFinite
+                ? h.areaGrazedPerDayHa.clamp(0.0, 999999999.0)
+                : 0.0,
+            supplementKgDmPerCowPerDay: h.supplementKgDmPerCowPerDay.isFinite
+                ? h.supplementKgDmPerCowPerDay.clamp(0.0, 999999999.0)
+                : 0.0,
+          ),
+        )
+        .toList();
+    await sp.setString(
+      _herdsKey,
+      jsonEncode(cleaned.map((h) => h.toMap()).toList()),
+    );
+    await _recordHerdTargetIfNeeded(totalAreaGrazedPerDayHa(cleaned));
+  }
+
+  static double totalAreaGrazedPerDayHa(List<Herd> herds) {
+    return herds.fold<double>(0.0, (sum, h) => sum + h.areaGrazedPerDayHa);
+  }
+
+  Future<List<HerdTargetSnapshot>> loadHerdTargetHistory() async {
+    final sp = await SharedPreferences.getInstance();
+    final raw = sp.getString(_herdTargetHistoryKey);
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      final list = jsonDecode(raw) as List;
+      final out = list
+          .whereType<Map>()
+          .map((e) => HerdTargetSnapshot.fromMap(Map<String, dynamic>.from(e)))
+          .toList();
+      out.sort((a, b) => a.at.compareTo(b.at));
+      return out;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> _saveHerdTargetHistory(List<HerdTargetSnapshot> history) async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setString(
+      _herdTargetHistoryKey,
+      jsonEncode(history.map((e) => e.toMap()).toList()),
+    );
+  }
+
+  /// Records target when total herd ha/day changes. Same-day edits replace the
+  /// last snapshot for that calendar day so the chart has one step per day.
+  Future<void> _recordHerdTargetIfNeeded(double targetHaDay) async {
+    final safe = targetHaDay.isFinite
+        ? targetHaDay.clamp(0.0, 999999999.0)
+        : 0.0;
+    final history = await loadHerdTargetHistory();
+    final now = DateTime.now();
+    if (history.isEmpty) {
+      await _saveHerdTargetHistory([
+        HerdTargetSnapshot(at: now, targetHaDay: safe),
+      ]);
+      return;
+    }
+    final last = history.last;
+    if ((last.targetHaDay - safe).abs() < 1e-9) return;
+
+    final today = DateTime(now.year, now.month, now.day);
+    final lastDay = DateTime(last.at.year, last.at.month, last.at.day);
+    if (lastDay == today) {
+      history[history.length - 1] =
+          HerdTargetSnapshot(at: now, targetHaDay: safe);
+    } else {
+      history.add(HerdTargetSnapshot(at: now, targetHaDay: safe));
+    }
+    await _saveHerdTargetHistory(history);
+  }
+
+  /// Target in effect on [day]: latest snapshot at or before that day.
+  /// Days before the first snapshot use the first known value.
+  static double targetHaDayOn(
+    List<HerdTargetSnapshot> history,
+    DateTime day, {
+    required double fallback,
+  }) {
+    if (history.isEmpty) return fallback;
+    final d = DateTime(day.year, day.month, day.day);
+    HerdTargetSnapshot? best;
+    for (final s in history) {
+      final sd = DateTime(s.at.year, s.at.month, s.at.day);
+      if (sd.isAfter(d)) break;
+      best = s;
+    }
+    return best?.targetHaDay ?? history.first.targetHaDay;
+  }
+
+  /// Ensures history exists (seeds current herds total if empty).
+  Future<List<HerdTargetSnapshot>> ensureHerdTargetHistory() async {
+    var history = await loadHerdTargetHistory();
+    if (history.isNotEmpty) return history;
+    final herds = await loadHerds();
+    // loadHerds may migrate via saveHerds and seed history.
+    history = await loadHerdTargetHistory();
+    if (history.isNotEmpty) return history;
+    final total = totalAreaGrazedPerDayHa(herds);
+    history = [HerdTargetSnapshot(at: DateTime.now(), targetHaDay: total)];
+    await _saveHerdTargetHistory(history);
+    return history;
   }
 
   Future<double?> loadManualFarmGrowthKgDmPerHaPerDay() async {
@@ -369,6 +547,7 @@ class Storage {
   static Anchor? latestAnchorFromLists(
     List<Measurement> allMeasurements,
     List<Grazing> allGrazings,
+    List<SilageCut> allSilageCuts,
     String paddockId,
     DateTime asOf,
   ) {
@@ -377,17 +556,48 @@ class Storage {
       if (m.paddockId != paddockId || m.at.isAfter(asOf)) continue;
       if (m0 == null || m.at.isAfter(m0.at)) m0 = m;
     }
+    
     Grazing? g0;
+    Grazing? gDuring; // grazing that's currently ongoing at asOf
+    
     for (final g in allGrazings) {
       if (g.paddockId != paddockId || g.at.isAfter(asOf)) continue;
-      if (g0 == null || g.at.isAfter(g0.at)) g0 = g;
+      
+      final grazingEnd = g.at.add(Duration(days: g.durationDays - 1));
+      final isDuring = !asOf.isBefore(g.at) && !asOf.isAfter(grazingEnd);
+      
+      if (isDuring) {
+        // If this grazing is during the asOf date, it takes precedence
+        if (gDuring == null || g.at.isAfter(gDuring.at)) {
+          gDuring = g;
+        }
+      } else if (g0 == null || g.at.isAfter(g0.at)) {
+        g0 = g;
+      }
     }
-    if (m0 == null && g0 == null) return null;
-    if (m0 != null && g0 == null) return Anchor(m0.at, m0.cover);
-    if (g0 != null && m0 == null) return Anchor(g0.at, g0.residual);
-    return m0!.at.isAfter(g0!.at)
-        ? Anchor(m0.at, m0.cover)
-        : Anchor(g0.at, g0.residual);
+
+    SilageCut? s0;
+    for (final s in allSilageCuts) {
+      if (s.paddockId != paddockId || s.at.isAfter(asOf)) continue;
+      if (s0 == null || s.at.isAfter(s0.at)) s0 = s;
+    }
+    
+    // If there's a grazing currently ongoing at asOf, use its residual
+    if (gDuring != null) {
+      return Anchor(gDuring.at, gDuring.residual);
+    }
+    
+    // Find latest among measurements, grazings, and silage cuts
+    final candidates = <Anchor>[];
+    if (m0 != null) candidates.add(Anchor(m0.at, m0.cover));
+    if (g0 != null) candidates.add(Anchor(g0.at, g0.residual));
+    if (s0 != null) candidates.add(Anchor(s0.at, s0.residual));
+    
+    if (candidates.isEmpty) return null;
+    
+    // Return the latest anchor
+    candidates.sort((a, b) => b.at.compareTo(a.at));
+    return candidates.first;
   }
 
   Future<List<Measurement>> measurementsForPaddock(String paddockId) async {
@@ -412,7 +622,8 @@ class Storage {
   ) async {
     final allM = await _loadMeasurements();
     final allG = await _loadGrazings();
-    return latestAnchorFromLists(allM, allG, paddockId, asOf);
+    final allS = await _loadSilageCuts();
+    return latestAnchorFromLists(allM, allG, allS, paddockId, asOf);
   }
 
   /// Overwrites measurement for today if present
@@ -689,7 +900,12 @@ class Storage {
     DateTime b,
   ) {
     return allG.any(
-      (x) => x.paddockId == paddockId && x.at.isAfter(a) && x.at.isBefore(b),
+      (x) {
+        if (x.paddockId != paddockId) return false;
+        final grazingEnd = x.at.add(Duration(days: x.durationDays - 1));
+        // Check if grazing overlaps with the interval (a, b)
+        return x.at.isBefore(b) && grazingEnd.isAfter(a);
+      },
     );
   }
 
@@ -936,6 +1152,78 @@ class Storage {
   ) async {
     final g = await _loadGrazings();
     return paddockGrazedBetweenFromList(g, paddockId, a, b);
+  }
+
+  // -----------------------------
+  // SILAGE CUTS
+  // -----------------------------
+  Future<List<SilageCut>> _loadSilageCuts() async {
+    final sp = await SharedPreferences.getInstance();
+    final raw = sp.getString(_silageCutsKey);
+    if (raw == null) return [];
+    final list = jsonDecode(raw) as List;
+    return list.map((e) => SilageCut.fromMap(e)).toList();
+  }
+
+  Future<void> _saveSilageCuts(List<SilageCut> all) async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setString(
+      _silageCutsKey,
+      jsonEncode(all.map((x) => x.toMap()).toList()),
+    );
+  }
+
+  Future<List<SilageCut>> loadAllSilageCuts() async => _loadSilageCuts();
+
+  Future<void> appendSilageCut(SilageCut c) async {
+    final all = await _loadSilageCuts();
+    all.add(c);
+    await _saveSilageCuts(all);
+  }
+
+  Future<void> deleteSilageCutById(String id) async {
+    final all = await _loadSilageCuts();
+    final before = all.length;
+    all.removeWhere((c) => c.id == id);
+    if (all.length < before) await _saveSilageCuts(all);
+  }
+
+  Future<void> updateSilageCut(SilageCut c) async {
+    final all = await _loadSilageCuts();
+    final i = all.indexWhere((x) => x.id == c.id);
+    if (i < 0) return;
+    all[i] = c;
+    await _saveSilageCuts(all);
+  }
+
+  Future<List<SilageCut>> silageCutsForPaddock(String paddockId) async {
+    final all = await _loadSilageCuts();
+    return all.where((c) => c.paddockId == paddockId).toList()
+      ..sort((a, b) => b.at.compareTo(a.at));
+  }
+
+  Future<SilageCut?> lastSilageCutForPaddock(String paddockId) async {
+    final list = await silageCutsForPaddock(paddockId);
+    return list.isEmpty ? null : list.first;
+  }
+
+  Future<int> annualSilageHarvestKgDmForPaddock(String paddockId) async {
+    final cuts = await _loadSilageCuts();
+    final year = DateTime.now().year;
+    return cuts
+        .where((x) => x.paddockId == paddockId && x.at.year == year)
+        .fold<int>(0, (a, b) => a + b.harvestedKgDm);
+  }
+
+  Future<Map<String, int>> annualSilageHarvestAllPaddocksKgDm() async {
+    final cuts = await _loadSilageCuts();
+    final year = DateTime.now().year;
+    final out = <String, int>{};
+
+    for (final x in cuts.where((e) => e.at.year == year)) {
+      out[x.paddockId] = (out[x.paddockId] ?? 0) + x.harvestedKgDm;
+    }
+    return out;
   }
 }
 

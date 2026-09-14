@@ -1,8 +1,21 @@
 import 'package:flutter/material.dart';
+import 'package:uuid/uuid.dart';
 
 import '../models.dart';
 import '../storage.dart';
 import '../utils.dart';
+
+// Union type for displaying grazings and silage cuts together
+class _GrazingOrSilage {
+  final Grazing? grazing;
+  final SilageCut? silageCut;
+  
+  bool get isSilage => silageCut != null;
+  
+  _GrazingOrSilage({this.grazing, this.silageCut}) 
+    : assert((grazing != null) ^ (silageCut != null), 
+             'Must provide either grazing or silageCut, not both or neither');
+}
 
 class PaddockHistoryScreen extends StatefulWidget {
   final Paddock paddock;
@@ -16,6 +29,7 @@ class PaddockHistoryScreen extends StatefulWidget {
 class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
     with SingleTickerProviderStateMixin {
   final storage = Storage();
+  final uuid = const Uuid();
   late final TabController _tabs;
 
   static const int _minCoverBar = 1200;
@@ -30,6 +44,9 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
   void initState() {
     super.initState();
     _tabs = TabController(length: 3, vsync: this);
+    _tabs.addListener(() {
+      if (mounted) setState(() {});
+    });
     _loadAnnualHarvest();
   }
 
@@ -301,6 +318,7 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
         preCover: preC,
         residual: resC,
         harvestedKgDm: harvested,
+        durationDays: g.durationDays,
       ),
     );
     if (!mounted) return;
@@ -394,6 +412,183 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
     _bumpRefresh();
   }
 
+  Future<void> _editSilageCut(SilageCut cut) async {
+    final preCtrl = TextEditingController(text: '${cut.preCover}');
+    final resCtrl = TextEditingController(text: '${cut.residual}');
+    var at = cut.at;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: const Text('Edit silage cut'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text('When: ${_fmtDateLong(at)}'),
+                TextButton(
+                  onPressed: () async {
+                    final next = await _pickDateTime(at);
+                    if (next != null) setLocal(() => at = next);
+                  },
+                  child: const Text('Change date & time'),
+                ),
+                TextField(
+                  controller: preCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Pre-cut cover (kgDM/ha)',
+                  ),
+                  keyboardType: TextInputType.number,
+                ),
+                TextField(
+                  controller: resCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Residual after cut (kgDM/ha)',
+                  ),
+                  keyboardType: TextInputType.number,
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    final pre = int.tryParse(preCtrl.text.trim());
+    final res = int.tryParse(resCtrl.text.trim());
+    if (pre == null || res == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter valid numbers.')),
+      );
+      return;
+    }
+    final preC = clampCover(pre);
+    final resC = clampCover(res);
+    final area = widget.paddock.areaHa;
+    final harvested = area <= 0
+        ? cut.harvestedKgDm
+        : ((preC - resC) * area).round().clamp(0, 999999999);
+
+    await storage.updateSilageCut(
+      SilageCut(
+        id: cut.id,
+        paddockId: cut.paddockId,
+        at: at,
+        preCover: preC,
+        residual: resC,
+        harvestedKgDm: harvested,
+      ),
+    );
+    if (!mounted) return;
+    _bumpRefresh();
+  }
+
+  Future<void> _addSilageCut() async {
+    final preCtrl = TextEditingController();
+    final resCtrl = TextEditingController();
+    var at = DateTime.now();
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: const Text('Record silage cut'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text('When: ${_fmtDateLong(at)}'),
+                TextButton(
+                  onPressed: () async {
+                    final next = await _pickDateTime(at);
+                    if (next != null) setLocal(() => at = next);
+                  },
+                  child: const Text('Change date & time'),
+                ),
+                TextField(
+                  controller: preCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Pre-cut cover (kgDM/ha)',
+                  ),
+                  keyboardType: TextInputType.number,
+                ),
+                TextField(
+                  controller: resCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Residual after cut (kgDM/ha)',
+                  ),
+                  keyboardType: TextInputType.number,
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    final pre = int.tryParse(preCtrl.text.trim());
+    final res = int.tryParse(resCtrl.text.trim());
+    if (pre == null || res == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter valid numbers.')),
+      );
+      return;
+    }
+    final preC = clampCover(pre);
+    final resC = clampCover(res);
+    final area = widget.paddock.areaHa;
+    final harvested = area <= 0
+        ? 0
+        : ((preC - resC) * area).round().clamp(0, 999999999);
+
+    await storage.appendSilageCut(SilageCut(
+      id: uuid.v4(),
+      paddockId: widget.paddock.id,
+      at: at,
+      preCover: preC,
+      residual: resC,
+      harvestedKgDm: harvested,
+    ));
+    if (!mounted) return;
+    _bumpRefresh();
+}
+
+  Future<void> _deleteSilageCut(SilageCut cut) async {
+    final ok = await _confirmDelete(
+      'Delete silage cut?',
+      'Remove this silage cut record? This cannot be undone.',
+    );
+    if (!ok || !mounted) return;
+    await storage.deleteSilageCutById(cut.id);
+    if (!mounted) return;
+    _bumpRefresh();
+  }
+
   @override
   Widget build(BuildContext context) {
     final p = widget.paddock;
@@ -414,6 +609,7 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
         controller: _tabs,
         children: [_coversTab(), _grazingsTab(), _notesTab()],
       ),
+      floatingActionButton: null,
       bottomNavigationBar: _statsBar(),
     );
   }
@@ -504,34 +700,60 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
   }
 
   // ---------------------------------------------------------------------------
-  // Grazings tab (columnised)
+  // Grazings tab (columnised) - shows both grazings and silage cuts
   // ---------------------------------------------------------------------------
   Widget _grazingsTab() {
-    return FutureBuilder<List<Grazing>>(
+    return FutureBuilder(
       key: ValueKey('grazings_$_refreshTick'),
-      future: storage.grazingsForPaddock(widget.paddock.id),
+      future: Future.wait([
+        storage.grazingsForPaddock(widget.paddock.id),
+        storage.silageCutsForPaddock(widget.paddock.id),
+      ]),
       builder: (context, snap) {
         if (!snap.hasData) {
           return const Center(child: CircularProgressIndicator());
         }
 
-        final grazings = snap.data!;
-        if (grazings.isEmpty) {
+        final grazings = snap.data![0] as List<Grazing>;
+        final silageCuts = snap.data![1] as List<SilageCut>;
+        
+        // Combine into a single list for display
+        final combined = <_GrazingOrSilage>[];
+        for (final g in grazings) {
+          combined.add(_GrazingOrSilage(grazing: g));
+        }
+        for (final s in silageCuts) {
+          combined.add(_GrazingOrSilage(silageCut: s));
+        }
+        
+        if (combined.isEmpty) {
           return const Center(child: Text('No grazing history yet.'));
         }
 
+        // Sort by date (newest first for past events)
+        combined.sort((a, b) {
+          final aDate = a.isSilage ? a.silageCut!.at : a.grazing!.at;
+          final bDate = b.isSilage ? b.silageCut!.at : b.grazing!.at;
+          return bDate.compareTo(aDate); // newest first
+        });
+
         final now = DateTime.now();
-        final upcoming = grazings.where((g) => g.at.isAfter(now)).toList()
-          ..sort((a, b) => a.at.compareTo(b.at));
-        final past = grazings.where((g) => !g.at.isAfter(now)).toList()
-          ..sort((a, b) => b.at.compareTo(a.at));
+        final upcoming = combined.where((item) {
+          final date = item.isSilage ? item.silageCut!.at : item.grazing!.at;
+          return date.isAfter(now);
+        }).toList();
+        
+        final past = combined.where((item) {
+          final date = item.isSilage ? item.silageCut!.at : item.grazing!.at;
+          return !date.isAfter(now);
+        }).toList();
 
         final listChildren = <Widget>[];
 
-        void addRows(List<Grazing> list, bool isUpcoming) {
+        void addRows(List<_GrazingOrSilage> list, bool isUpcoming) {
           for (var i = 0; i < list.length; i++) {
             listChildren.add(
-              _grazingRow(context, list[i], isUpcoming: isUpcoming),
+              _grazingOrSilageRow(context, list[i], isUpcoming: isUpcoming),
             );
             if (i < list.length - 1) {
               listChildren.add(const Divider(height: 1));
@@ -608,12 +830,21 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
     );
   }
 
-  Widget _grazingRow(
+  
+
+  Widget _grazingOrSilageRow(
     BuildContext context,
-    Grazing g, {
+    _GrazingOrSilage item, {
     required bool isUpcoming,
   }) {
     final cs = Theme.of(context).colorScheme;
+    final isSilage = item.isSilage;
+    final grazing = item.grazing;
+    final silageCut = item.silageCut;
+    
+    final at = isSilage ? silageCut!.at : grazing!.at;
+    final preCover = isSilage ? silageCut!.preCover : grazing!.preCover;
+    final residual = isSilage ? silageCut!.residual : grazing!.residual;
 
     final menu = SizedBox(
       width: 40,
@@ -625,8 +856,13 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
           color: Colors.black.withValues(alpha: 0.55),
         ),
         onSelected: (v) async {
-          if (v == 'edit') await _editGrazing(g);
-          if (v == 'delete') await _deleteGrazing(g);
+          if (isSilage) {
+            if (v == 'edit') await _editSilageCut(silageCut!);
+            if (v == 'delete') await _deleteSilageCut(silageCut!);
+          } else {
+            if (v == 'edit') await _editGrazing(grazing!);
+            if (v == 'delete') await _deleteGrazing(grazing!);
+          }
         },
         itemBuilder: (ctx) => const [
           PopupMenuItem(value: 'edit', child: Text('Edit')),
@@ -655,7 +891,7 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             Text(
-                              _fmtDateShort(g.at),
+                              _fmtDateShort(at),
                               textAlign: TextAlign.center,
                               style: const TextStyle(
                                 fontSize: 14,
@@ -675,11 +911,23 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
                       ),
                     ],
                   )
-                : _Cell(_fmtDateShort(g.at)),
+                : Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      if (isSilage)
+                        Icon(
+                          Icons.grass,
+                          size: 14,
+                          color: Colors.amber.shade700,
+                        ),
+                      if (isSilage) const SizedBox(width: 4),
+                      _Cell(_fmtDateShort(at)),
+                    ],
+                  ),
           ),
-          _Cell(g.preCover.toString()),
-          _Cell(g.residual.toString()),
-          _Cell(_harvestPerHaText(g)),
+          _Cell(preCover.toString()),
+          _Cell(residual.toString()),
+          _Cell(_harvestPerHaTextForItem(item)),
           menu,
         ],
       ),
@@ -689,13 +937,29 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
 
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: cs.tertiaryContainer.withValues(alpha: 0.45),
+        color: isSilage 
+            ? Colors.amber.withValues(alpha: 0.15)
+            : cs.tertiaryContainer.withValues(alpha: 0.45),
         border: Border(
-          left: BorderSide(color: cs.tertiary, width: 3),
+          left: BorderSide(
+            color: isSilage ? Colors.amber : cs.tertiary, 
+            width: 3,
+          ),
         ),
       ),
       child: row,
     );
+  }
+
+  String _harvestPerHaTextForItem(_GrazingOrSilage item) {
+    if (item.isSilage) {
+      final area = widget.paddock.areaHa;
+      if (area <= 0) return '—';
+      final perHa = item.silageCut!.harvestedKgDm / area;
+      return perHa.toStringAsFixed(0);
+    } else {
+      return _harvestPerHaText(item.grazing!);
+    }
   }
 
   // ---------------------------------------------------------------------------
