@@ -15,6 +15,7 @@ import 'paddock_history_screen.dart';
 import 'avg_cover_history_screen.dart';
 import 'grazing_accuracy_screen.dart';
 import 'grazing_schedule_preview_screen.dart';
+import 'silage_summary_screen.dart';
 import '../widgets/grazing_calendar_board.dart';
 
 const _coverHeatStops = <(double, Color)>[
@@ -398,6 +399,7 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _load() async {
+    await storage.migrateSilagePaddocks();
     paddocks = await storage.loadPaddocks();
     paddocks.sort((a, b) => a.recordOrder.compareTo(b.recordOrder));
     loaded = true;
@@ -978,8 +980,8 @@ class _HomeScreenState extends State<HomeScreen>
           areaHa: p.areaHa,
           recordOrder: p.recordOrder,
           includeInRotation: false, // Exclude from rotation
-          isSilage: p.isSilage,
-          shutForSilage: true, // Mark as shut for silage
+          isSilage: true,           // Mark as silage paddock
+          shutForSilage: true,      // Mark as shut for silage
         ));
       } else {
         updated.add(p);
@@ -2200,23 +2202,22 @@ color: p.shutForSilage
       color: Colors.orange.withValues(alpha: 0.95),
     );
   }
-
-
-  Widget _summaryTab(List<_RowData> rows) {
-    final included = rows.where((r) => r.paddock.includeInRotation && !r.paddock.isSilage).toList();
-    included.sort((a, b) => b.predicted.compareTo(a.predicted));
-
-    final predicted = included
+int _calculateAveragePredicted(List<_RowData> rows) {
+    final predicted = rows
         .map((r) => r.predicted)
         .where((v) => v > 0)
         .toList();
-    final avgCover = predicted.isEmpty
+    return predicted.isEmpty
         ? 0
         : (predicted.reduce((a, b) => a + b) / predicted.length).round();
+  }
 
+  (int?, DateTime?) _calculateMeasuredAverage(List<_RowData> rows) {
+    if (rows.isEmpty) return (null, null);
+    
     DateTime? lastMeasureDay;
     DateTime? lastMeasureAt;
-    for (final r in included) {
+    for (final r in rows) {
       if (r.lastAt == null) continue;
       final d = calendarDay(r.lastAt!);
       if (lastMeasureDay == null ||
@@ -2226,21 +2227,49 @@ color: p.shutForSilage
         lastMeasureAt = r.lastAt;
       }
     }
+    
+    if (lastMeasureDay == null) return (null, null);
+    
     final measuredCovers = <int>[];
-    if (lastMeasureDay != null) {
-      for (final r in included) {
-        if (r.lastCover == null || r.lastAt == null) continue;
-        if (calendarDay(r.lastAt!) == lastMeasureDay) {
-          measuredCovers.add(r.lastCover!);
-        }
+    for (final r in rows) {
+      if (r.lastCover == null || r.lastAt == null) continue;
+      if (calendarDay(r.lastAt!) == lastMeasureDay) {
+        measuredCovers.add(r.lastCover!);
       }
     }
-    final measuredAvg = measuredCovers.isEmpty
-        ? null
-        : (measuredCovers.reduce((a, b) => a + b) / measuredCovers.length)
-            .round();
+    
+    return measuredCovers.isEmpty
+        ? (null, null)
+        : ((measuredCovers.reduce((a, b) => a + b) / measuredCovers.length).round(), lastMeasureAt);
+  }
 
-    final wedgePaddocks = included.where((r) => r.predicted > 0).map((r) {
+
+  Widget _summaryTab(List<_RowData> rows) {
+    // Calculate averages for different categories
+    
+    // 1. All paddocks (normal + silage, including those temporarily excluded from rotation for silage)
+    final allInRotationRows = rows.where((r) => r.paddock.includeInRotation || r.paddock.isSilage).toList();
+    
+    // 2. In-round paddocks (normal only, silage excluded)
+    final inRoundRows = rows.where((r) => r.paddock.includeInRotation && !r.paddock.isSilage).toList();
+    
+    // 3. Silage paddocks only
+    final silageRows = rows.where((r) => r.paddock.isSilage).toList();
+    
+    // Calculate predicted averages for each category
+    final allPredicted = _calculateAveragePredicted(allInRotationRows);
+    final inRoundPredicted = _calculateAveragePredicted(inRoundRows);
+    final silagePredicted = _calculateAveragePredicted(silageRows);
+    
+    // Calculate measured averages for each category
+    final (allMeasuredAvg, allMeasuredAt) = _calculateMeasuredAverage(allInRotationRows);
+    final (inRoundMeasuredAvg, inRoundMeasuredAt) = _calculateMeasuredAverage(inRoundRows);
+    final (silageMeasuredAvg, silageMeasuredAt) = _calculateMeasuredAverage(silageRows);
+    
+    // Calculate area excluded for silage
+    final silageExcludedArea = silageRows.fold(0.0, (sum, r) => sum + r.paddock.areaHa);
+    
+    final wedgePaddocks = inRoundRows.where((r) => r.predicted > 0).map((r) {
       final m = RegExp(r'\d+').firstMatch(r.paddock.name);
       final label = m?.group(0) ?? '';
       return _WedgePaddock(label: label, cover: r.predicted);
@@ -2255,7 +2284,7 @@ color: p.shutForSilage
           height: 64,
           child: FilledButton(
             onPressed: () async {
-              if (included.isEmpty) {
+              if (inRoundRows.isEmpty) {
                 if (!context.mounted) return;
                 await showDialog<void>(
                   context: context,
@@ -2296,9 +2325,16 @@ color: p.shutForSilage
         ),
         const SizedBox(height: 12),
         _summaryCards(
-          avgCover: avgCover,
-          measuredAvg: measuredAvg,
-          measuredAt: lastMeasureAt,
+          allMeasuredAvg: allMeasuredAvg,
+          allMeasuredAt: allMeasuredAt,
+          allExpectedAvg: allPredicted,
+          inRoundMeasuredAvg: inRoundMeasuredAvg,
+          inRoundMeasuredAt: inRoundMeasuredAt,
+          inRoundExpectedAvg: inRoundPredicted,
+          silageExcludedArea: silageExcludedArea,
+          silageMeasuredAvg: silageMeasuredAvg,
+          silageMeasuredAt: silageMeasuredAt,
+          silageExpectedAvg: silagePredicted,
         ),
         const SizedBox(height: 12),
         _FeedWedge(
@@ -3069,8 +3105,9 @@ color: p.shutForSilage
     required String title,
     required String value,
     required String subtitle,
+    VoidCallback? onTap,
   }) {
-    return Column(
+    final content = Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -3108,90 +3145,150 @@ color: p.shutForSilage
         ),
       ],
     );
+    
+    if (onTap != null) {
+      return InkWell(
+        onTap: onTap,
+        child: content,
+      );
+    }
+    
+    return content;
   }
 
   Widget _avgCoverCard({
-    required int? measuredAvg,
-    required DateTime? measuredAt,
-    required int expectedAvg,
+    required int? allMeasuredAvg,
+    required DateTime? allMeasuredAt,
+    required int allExpectedAvg,
+    required int? inRoundMeasuredAvg,
+    required DateTime? inRoundMeasuredAt,
+    required int inRoundExpectedAvg,
+    required double silageExcludedArea,
+    required int? silageMeasuredAvg,
+    required DateTime? silageMeasuredAt,
+    required int silageExpectedAvg,
   }) {
     final now = DateTime.now();
-    final measuredLabel = measuredAt == null
-        ? 'No measurements'
-        : daysAgoLabel(now, measuredAt);
-    final measuredValue = measuredAvg?.toString() ?? '—';
-    final expectedValue = expectedAvg > 0 ? '$expectedAvg' : '—';
-
-    return InkWell(
-      onTap: () async {
-        await Navigator.of(context).push(
-          MaterialPageRoute(builder: (_) => const AvgCoverHistoryScreen()),
-        );
+    
+    // Helper function to create label
+    String createLabel(DateTime? at, String fallback) {
+      return at == null ? fallback : daysAgoLabel(now, at);
+    }
+    
+    // Helper function to create value string
+    String createValue(int? value) => value?.toString() ?? '—';
+    
+    // Create slides data
+    final slides = [
+      // Slide 1: Last measurement (all paddocks)
+      {
+        'title': 'Last measurement',
+        'value': createValue(allMeasuredAvg),
+        'subtitle': 'kgDM/ha · ${createLabel(allMeasuredAt, "No measurements")}',
+        'onTap': () async {
+          await Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const AvgCoverHistoryScreen()),
+          );
+        },
       },
-      child: Card(
-        elevation: 0,
-        color: Colors.black.withValues(alpha: 0.04),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(
-            horizontal: 12,
-            vertical: 10,
-          ),
-          child: SizedBox(
-                height: 72,
-                child: Stack(
-                  clipBehavior: Clip.hardEdge,
+      // Slide 2: Expected (all paddocks)
+      {
+        'title': 'Expected',
+        'value': allExpectedAvg > 0 ? '$allExpectedAvg' : '—',
+        'subtitle': 'kgDM/ha · predicted',
+        'onTap': () async {
+          await Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const AvgCoverHistoryScreen()),
+          );
+        },
+      },
+      // Slide 3: In round (expected APC for normal paddocks only, excluding silage)
+      {
+        'title': 'In round',
+        'value': inRoundExpectedAvg > 0 ? '$inRoundExpectedAvg' : '—',
+        'subtitle': 'kgDM/ha · predicted',
+        'onTap': () async {
+          await Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const AvgCoverHistoryScreen()),
+          );
+        },
+      },
+      // Slide 4: Silage covers (measured when available, otherwise predicted for silage paddocks only)
+      {
+        'title': 'Silage covers',
+        'value': createValue(silageMeasuredAvg ?? (silageExpectedAvg > 0 ? silageExpectedAvg : null)),
+        'subtitle': 'kgDM/ha · ${silageMeasuredAvg != null ? createLabel(silageMeasuredAt, "measured") : "predicted"}',
+        'onTap': () async {
+          await Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const SilageSummaryScreen()),
+          );
+        },
+      },
+    ];
+    
+    return Card(
+      elevation: 0,
+      color: Colors.black.withValues(alpha: 0.04),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(
+          horizontal: 12,
+          vertical: 10,
+        ),
+        child: SizedBox(
+          height: 72,
+          child: Stack(
+            clipBehavior: Clip.hardEdge,
+            children: [
+              Padding(
+                padding: const EdgeInsets.only(right: 18),
+                child: PageView(
                   children: [
-                    Padding(
-                      padding: const EdgeInsets.only(right: 18),
-                      child: PageView(
-                        children: [
-                          FittedBox(
-                            fit: BoxFit.scaleDown,
-                            alignment: Alignment.topLeft,
-                            child: _avgCoverSlide(
-                              title: 'Last measurement',
-                              value: measuredValue,
-                              subtitle: 'kgDM/ha · $measuredLabel',
-                            ),
-                          ),
-                          FittedBox(
-                            fit: BoxFit.scaleDown,
-                            alignment: Alignment.topLeft,
-                            child: _avgCoverSlide(
-                              title: 'Expected',
-                              value: expectedValue,
-                              subtitle: 'kgDM/ha · predicted',
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const Positioned(
-                      right: -6,
-                      top: 0,
-                      bottom: 0,
-                      child: IgnorePointer(
-                        child: Center(
-                          child: Icon(
-                            Icons.chevron_right,
-                            size: 22,
-                            color: Colors.black38,
-                          ),
+                    for (final slide in slides)
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.topLeft,
+                        child: _avgCoverSlide(
+                          title: slide['title'] as String,
+                          value: slide['value'] as String,
+                          subtitle: slide['subtitle'] as String,
+                          onTap: slide['onTap'] as VoidCallback?,
                         ),
                       ),
-                    ),
                   ],
                 ),
               ),
+              const Positioned(
+                right: -6,
+                top: 0,
+                bottom: 0,
+                child: IgnorePointer(
+                  child: Center(
+                    child: Icon(
+                      Icons.chevron_right,
+                      size: 22,
+                      color: Colors.black38,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
   Widget _summaryCards({
-    required int avgCover,
-    required int? measuredAvg,
-    required DateTime? measuredAt,
+    required int? allMeasuredAvg,
+    required DateTime? allMeasuredAt,
+    required int allExpectedAvg,
+    required int? inRoundMeasuredAvg,
+    required DateTime? inRoundMeasuredAt,
+    required int inRoundExpectedAvg,
+    required double silageExcludedArea,
+    required int? silageMeasuredAvg,
+    required DateTime? silageMeasuredAt,
+    required int silageExpectedAvg,
   }) {
     return FutureBuilder<List<dynamic>>(
       future: _summaryCardsFuture ??= Future.wait([
@@ -3288,9 +3385,16 @@ color: p.shutForSilage
               children: [
                 Expanded(
                   child: _avgCoverCard(
-                    measuredAvg: measuredAvg,
-                    measuredAt: measuredAt,
-                    expectedAvg: avgCover,
+                    allMeasuredAvg: allMeasuredAvg,
+                    allMeasuredAt: allMeasuredAt,
+                    allExpectedAvg: allExpectedAvg,
+                    inRoundMeasuredAvg: inRoundMeasuredAvg,
+                    inRoundMeasuredAt: inRoundMeasuredAt,
+                    inRoundExpectedAvg: inRoundExpectedAvg,
+                    silageExcludedArea: silageExcludedArea,
+                    silageMeasuredAvg: silageMeasuredAvg,
+                    silageMeasuredAt: silageMeasuredAt,
+                    silageExpectedAvg: silageExpectedAvg,
                   ),
                 ),
                   const SizedBox(width: 10),

@@ -475,7 +475,7 @@ class Storage {
 
   Future<Set<String>> _includedPaddockIds() async {
     final paddocks = await loadPaddocks();
-    return paddocks.where((p) => p.includeInRotation).map((p) => p.id).toSet();
+    return paddocks.where((p) => p.includeInRotation || p.isSilage).map((p) => p.id).toSet();
   }
 
   Future<Measurement?> _previousMeasurementBefore(
@@ -1224,6 +1224,28 @@ class Storage {
       out[x.paddockId] = (out[x.paddockId] ?? 0) + x.harvestedKgDm;
     }
     return out;
+  }
+
+  Future<void> migrateSilagePaddocks() async {
+    final paddocks = await loadPaddocks();
+    final updated = paddocks.map((p) {
+      if (p.shutForSilage && !p.isSilage) {
+        return Paddock(
+          id: p.id,
+          name: p.name,
+          areaHa: p.areaHa,
+          recordOrder: p.recordOrder,
+          includeInRotation: p.includeInRotation,
+          isSilage: true,
+          shutForSilage: p.shutForSilage,
+        );
+      }
+      return p;
+    }).toList();
+
+    if (updated.length != paddocks.length) {
+      await savePaddocks(updated);
+    }
   }
 }
 
