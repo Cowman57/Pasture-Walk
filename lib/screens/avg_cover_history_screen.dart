@@ -103,7 +103,7 @@ class _AvgCoverHistoryScreenState extends State<AvgCoverHistoryScreen> {
   Future<List<_DayPoint>> _loadSeries(DateTimeRange range) async {
     final paddocks = await storage.loadPaddocks();
     final includedIds = paddocks
-        .where((p) => p.includeInRotation || p.isSilage)
+        .where((p) => p.includeInRotation || p.isSilage || p.shutForSilage)
         .map((p) => p.id)
         .toSet();
 
@@ -136,7 +136,7 @@ class _AvgCoverHistoryScreenState extends State<AvgCoverHistoryScreen> {
   Future<int?> _loadPredictedCover() async {
     final now = DateTime.now();
     final paddocks = await storage.loadPaddocks();
-    final included = paddocks.where((p) => p.includeInRotation || p.isSilage).toList();
+    final included = paddocks.where((p) => p.includeInRotation || p.isSilage || p.shutForSilage).toList();
     if (included.isEmpty) return null;
 
     final manualGrowth = await storage.loadManualFarmGrowthKgDmPerHaPerDay();
@@ -197,7 +197,7 @@ class _AvgCoverHistoryScreenState extends State<AvgCoverHistoryScreen> {
   Future<List<_DayPoint>> _loadGrowthSeries(DateTimeRange range) async {
     final paddocks = await storage.loadPaddocks();
     final includedIds = paddocks
-        .where((p) => p.includeInRotation || p.isSilage)
+        .where((p) => p.includeInRotation || p.isSilage || p.shutForSilage)
         .map((p) => p.id)
         .toSet();
 

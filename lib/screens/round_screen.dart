@@ -264,7 +264,7 @@ class _RoundScreenState extends State<RoundScreen>
 
   Future<void> _init() async {
     order = await storage.loadPaddocks();
-    order = order.where((p) => p.includeInRotation).toList();
+    order = order.where((p) => p.includeInRotation || p.shutForSilage).toList();
     order.sort((a, b) => a.recordOrder.compareTo(b.recordOrder));
 
     final manualGrowth = await storage.loadManualFarmGrowthKgDmPerHaPerDay();
@@ -280,9 +280,9 @@ class _RoundScreenState extends State<RoundScreen>
     final allMeasurements = batch[0] as List<Measurement>;
     final allGrazings = batch[1] as List<Grazing>;
     final allSilageCuts = batch[2] as List<SilageCut>;
-    noteBtn1 = batch[2] as String;
-    noteBtn2 = batch[3] as String;
-    coverStep = batch[4] as int;
+    noteBtn1 = batch[3] as String;
+    noteBtn2 = batch[4] as String;
+    coverStep = batch[5] as int;
 
     final includedIds = order.map((p) => p.id).toSet();
     farmGrowth = manualGrowth ??
@@ -520,7 +520,7 @@ class _RoundScreenState extends State<RoundScreen>
         if (ring == null || ring.length < 3) continue;
         if (_pointInRing(lat: lat, lon: lon, ring: ring)) {
           final meta = paddockById[paddockId];
-          if (meta != null && !meta.includeInRotation) {
+          if (meta != null && !meta.includeInRotation && !meta.shutForSilage) {
             if (!_gpsExcludedWarned && mounted) {
               _gpsExcludedWarned = true;
               ScaffoldMessenger.of(context).showSnackBar(
@@ -629,7 +629,7 @@ class _RoundScreenState extends State<RoundScreen>
         final ring = _ringToLatLon(ringAny);
         if (ring == null || ring.length < 3) continue;
         if (_pointInRing(lat: lat, lon: lon, ring: ring)) {
-          if (meta != null && !meta.includeInRotation) {
+          if (meta != null && !meta.includeInRotation && !meta.shutForSilage) {
             if (!_gpsExcludedWarned && mounted) {
               _gpsExcludedWarned = true;
               ScaffoldMessenger.of(context).showSnackBar(

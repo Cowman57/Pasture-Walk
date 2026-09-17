@@ -2248,13 +2248,13 @@ int _calculateAveragePredicted(List<_RowData> rows) {
     // Calculate averages for different categories
     
     // 1. All paddocks (normal + silage, including those temporarily excluded from rotation for silage)
-    final allInRotationRows = rows.where((r) => r.paddock.includeInRotation || r.paddock.isSilage).toList();
+    final allInRotationRows = rows.where((r) => r.paddock.includeInRotation || r.paddock.isSilage || r.paddock.shutForSilage).toList();
     
     // 2. In-round paddocks (normal only, silage excluded)
-    final inRoundRows = rows.where((r) => r.paddock.includeInRotation && !r.paddock.isSilage).toList();
+    final inRoundRows = rows.where((r) => r.paddock.includeInRotation && !r.paddock.isSilage && !r.paddock.shutForSilage).toList();
     
     // 3. Silage paddocks only
-    final silageRows = rows.where((r) => r.paddock.isSilage).toList();
+    final silageRows = rows.where((r) => r.paddock.isSilage || r.paddock.shutForSilage).toList();
     
     // Calculate predicted averages for each category
     final allPredicted = _calculateAveragePredicted(allInRotationRows);
@@ -3317,12 +3317,12 @@ int _calculateAveragePredicted(List<_RowData> rows) {
             : <Grazing>[];
 
         final includedIds = allPaddocks
-            .where((p) => p.includeInRotation && !p.isSilage)
+            .where((p) => p.includeInRotation && !p.isSilage && !p.shutForSilage)
             .map((p) => p.id)
             .toSet();
 
         final includedArea = allPaddocks
-            .where((p) => p.includeInRotation && !p.isSilage)
+            .where((p) => p.includeInRotation && !p.isSilage && !p.shutForSilage)
             .fold<double>(0.0, (sum, p) => sum + p.areaHa);
 
         final roundLengthDays = (areaPerDay > 0 && includedArea > 0)
@@ -4024,7 +4024,7 @@ class _FeedWedge extends StatelessWidget {
   Future<({int? avgPre, int? avgPost})> _autoPrePost() async {
     final paddocksAll = await storage.loadPaddocks();
     final includedIds = paddocksAll
-        .where((p) => p.includeInRotation && !p.isSilage)
+        .where((p) => p.includeInRotation && !p.isSilage && !p.shutForSilage)
         .map((p) => p.id)
         .toSet();
 

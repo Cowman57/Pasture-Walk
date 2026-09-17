@@ -91,7 +91,7 @@ class _KPIsScreenState extends State<KPIsScreen> {
 
     // Load base data
     final paddocks = await storage.loadPaddocks();
-    final included = paddocks.where((p) => p.includeInRotation).toList();
+    final included = paddocks.where((p) => p.includeInRotation && !p.isSilage && !p.shutForSilage).toList();
     final includedIds = included.map((p) => p.id).toSet();
 
     final msAll = await storage.loadAllMeasurements();
@@ -341,7 +341,7 @@ class _KPIsScreenState extends State<KPIsScreen> {
 
                 _KpiCard(
                   title: 'Problem paddocks (worst growth)',
-                  value: 'Bottom ${problem.length} (excluded paddocks ignored)',
+                  value: 'Bottom ${problem.length} (excluded & silage paddocks ignored)',
                   child: problem.isEmpty
                       ? const Padding(
                           padding: EdgeInsets.symmetric(vertical: 12),

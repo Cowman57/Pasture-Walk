@@ -8,3 +8,8 @@
 .externalNativeBuild
 .cxx
 local.properties
+/flutter/
+jdk-*/
+flutter_linux_3.16.9-stable.tar.xz
+openjdk-*.tar.gz
+lazygit.tar.gz

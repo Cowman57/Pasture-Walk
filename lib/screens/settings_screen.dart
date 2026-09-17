@@ -258,6 +258,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final text = utf8.decode(bytes);
       await storage.restoreBackupJson(text);
 
+      // Migrate silage paddocks after restore
+      await storage.migrateSilagePaddocks();
+
       final paddocks = await storage.loadPaddocks();
       final measurements = await storage.loadAllMeasurements();
       final grazingsBefore = await storage.loadAllGrazings();

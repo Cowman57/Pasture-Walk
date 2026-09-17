@@ -274,7 +274,7 @@ class _SilageSummaryScreenState extends State<SilageSummaryScreen> {
           final silageCuts = data[1] as List<SilageCut>;
           final annualHarvest = data[2] as Map<String, int>;
           
-          final silagePaddocks = paddocks.where((p) => p.isSilage).toList();
+          final silagePaddocks = paddocks.where((p) => p.isSilage || p.shutForSilage).toList();
           
           return _buildContent(silagePaddocks, silageCuts, annualHarvest);
         },
