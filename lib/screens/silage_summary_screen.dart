@@ -185,7 +185,7 @@ class _SilageSummaryScreenState extends State<SilageSummaryScreen> {
             areaHa: p.areaHa,
             recordOrder: p.recordOrder,
             includeInRotation: true, // Reincluded in rotation
-            isSilage: p.isSilage,
+            isSilage: false, // No longer a silage paddock after silage cut
             shutForSilage: false, // No longer shut for silage
           );
         }

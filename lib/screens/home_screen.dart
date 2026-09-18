@@ -1021,7 +1021,7 @@ class _HomeScreenState extends State<HomeScreen>
           areaHa: p.areaHa,
           recordOrder: p.recordOrder,
           includeInRotation: true, // Include in rotation
-          isSilage: p.isSilage,
+          isSilage: false, // No longer a silage paddock after reopening
           shutForSilage: false, // No longer shut for silage
         ));
       } else {
@@ -1147,24 +1147,24 @@ class _HomeScreenState extends State<HomeScreen>
         harvestedKgDm: harvested,
       ));
 
-      // Reopen paddock for grazing (automatically reincluded)
-      final paddocks = await storage.loadPaddocks();
-      final updated = <Paddock>[];
-      for (final p in paddocks) {
-        if (p.id == row.paddock.id) {
-          updated.add(Paddock(
-            id: p.id,
-            name: p.name,
-            areaHa: p.areaHa,
-            recordOrder: p.recordOrder,
-            includeInRotation: true, // Reincluded in rotation
-            isSilage: p.isSilage,
-            shutForSilage: false, // No longer shut for silage
-          ));
-        } else {
-          updated.add(p);
-        }
-      }
+          // Reopen paddock for grazing (automatically reincluded)
+          final paddocks = await storage.loadPaddocks();
+          final updated = <Paddock>[];
+          for (final p in paddocks) {
+            if (p.id == row.paddock.id) {
+              updated.add(Paddock(
+                id: p.id,
+                name: p.name,
+                areaHa: p.areaHa,
+                recordOrder: p.recordOrder,
+                includeInRotation: true, // Reincluded in rotation
+                isSilage: false, // No longer a silage paddock after silage cut
+                shutForSilage: false, // No longer shut for silage
+              ));
+            } else {
+              updated.add(p);
+            }
+          }
       await storage.savePaddocks(updated);
     }
 
