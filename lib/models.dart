@@ -159,6 +159,15 @@ class Grazing {
   final int harvestedKgDm;
   /// How many calendar days this grazing occupies (for planning / ha/day spread).
   final int durationDays;
+  /// Optional link to the grazing-plan slot (herd break) this record fulfils.
+  /// Herd is derived from the slot. Null = unassigned / legacy record.
+  final String? slotId;
+  /// Actual area grazed for this record. Null = use the paddock's full area.
+  /// Lets a paddock be split (e.g. half for an AM break, half for PM).
+  final double? areaHa;
+  /// Links records that together form one planned block (a paddock grazed
+  /// across one or more breaks and/or multiple days). Null = standalone.
+  final String? groupId;
 
   Grazing({
     required this.id,
@@ -169,6 +178,9 @@ class Grazing {
     required this.residual,
     required this.harvestedKgDm,
     this.durationDays = 1,
+    this.slotId,
+    this.areaHa,
+    this.groupId,
   }) : enteredAt = enteredAt ?? at;
 
   Map<String, dynamic> toMap() => {
@@ -180,6 +192,9 @@ class Grazing {
     'residual': residual,
     'harvestedKgDm': harvestedKgDm,
     'durationDays': durationDays,
+    'slotId': slotId,
+    'areaHa': areaHa,
+    'groupId': groupId,
   };
 
   static Grazing fromMap(Map<String, dynamic> m) {
@@ -198,8 +213,68 @@ class Grazing {
       residual: m['residual'],
       harvestedKgDm: m['harvestedKgDm'],
       durationDays: dur,
+      slotId: m['slotId'] as String?,
+      areaHa: (m['areaHa'] as num?)?.toDouble(),
+      groupId: m['groupId'] as String?,
     );
   }
+}
+
+/// A recurring grazing break (slot) belonging to a herd, used by the planner.
+/// e.g. Herd "Milkers" -> slots "AM" (12h, 1.5 ha), "PM" (12h, 3.0 ha).
+class GrazingSlot {
+  final String id;
+  final String herdId;
+  final String label;
+  final double hours;
+  final double targetAreaHa;
+  final int sortOrder;
+
+  GrazingSlot({
+    required this.id,
+    required this.herdId,
+    required this.label,
+    this.hours = 12.0,
+    this.targetAreaHa = 0.0,
+    this.sortOrder = 0,
+  });
+
+  GrazingSlot copyWith({
+    String? id,
+    String? herdId,
+    String? label,
+    double? hours,
+    double? targetAreaHa,
+    int? sortOrder,
+  }) => GrazingSlot(
+    id: id ?? this.id,
+    herdId: herdId ?? this.herdId,
+    label: label ?? this.label,
+    hours: hours ?? this.hours,
+    targetAreaHa: targetAreaHa ?? this.targetAreaHa,
+    sortOrder: sortOrder ?? this.sortOrder,
+  );
+
+  Map<String, dynamic> toMap() => {
+    'id': id,
+    'herdId': herdId,
+    'label': label,
+    'hours': hours,
+    'targetAreaHa': targetAreaHa,
+    'sortOrder': sortOrder,
+  };
+
+  static GrazingSlot fromMap(Map<String, dynamic> m) => GrazingSlot(
+    id: m['id'] as String,
+    herdId: (m['herdId'] as String?) ?? '',
+    label: (m['label'] as String?)?.trim().isNotEmpty == true
+        ? (m['label'] as String).trim()
+        : 'Break',
+    hours: ((m['hours'] as num?)?.toDouble() ?? 12.0).clamp(0.0, 168.0),
+    targetAreaHa: ((m['targetAreaHa'] as num?)?.toDouble() ?? 0.0)
+        .clamp(0.0, 999999999.0),
+    sortOrder: (m['sortOrder'] as num?)?.toInt() ?? 0,
+  );
 }
 
 class NoteEntry {

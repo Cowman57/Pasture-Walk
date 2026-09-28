@@ -7,10 +7,16 @@ class PastureWalkApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Pasture Walk',
+      title: 'PastureWalk',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
         useMaterial3: true,
+        appBarTheme: const AppBarTheme(
+          toolbarHeight: 48,
+          centerTitle: false,
+          titleSpacing: 0,
+          scrolledUnderElevation: 0,
+        ),
       ),
       home: const HomeScreen(),
     );

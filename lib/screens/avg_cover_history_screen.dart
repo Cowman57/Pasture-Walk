@@ -712,7 +712,7 @@ class _LineChartPainter extends CustomPainter {
     // Vertical grid + x labels
     final dayStep = _niceDayStep(spanDays);
     for (int dd = 0; dd <= xSpanDays; dd += dayStep) {
-      final d = firstDay.add(Duration(days: dd));
+      final d = DateTime(firstDay.year, firstDay.month, firstDay.day + dd);
       final xFrac = dd / xSpanDays;
       final xx = plot.left + xFrac * plot.width;
       canvas.drawLine(Offset(xx, plot.top), Offset(xx, plot.bottom), grid);

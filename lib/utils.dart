@@ -24,3 +24,27 @@ String formatIntWithCommas(int n) {
   }
   return buf.toString();
 }
+
+DateTime calendarDay(DateTime d) => DateTime(d.year, d.month, d.day);
+
+/// Spreads a grazing's area / harvest across its [durationDays] for daily charts.
+void forEachGrazingAllocationDay(
+  DateTime at,
+  int durationDays, {
+  required double areaHa,
+  required double harvestedKgDm,
+  required void Function(DateTime day, double areaHa, double harvestedKgDm) fn,
+}) {
+  final start = calendarDay(at);
+  final days = durationDays < 1 ? 1 : durationDays;
+  final areaShare = areaHa / days;
+  final harvestShare = harvestedKgDm / days;
+  for (var i = 0; i < days; i++) {
+    // Calendar-add so a run never drifts/skips across a DST change.
+    fn(
+      DateTime(start.year, start.month, start.day + i),
+      areaShare,
+      harvestShare,
+    );
+  }
+}

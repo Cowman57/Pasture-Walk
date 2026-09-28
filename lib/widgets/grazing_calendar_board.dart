@@ -37,7 +37,8 @@ class GrazingCalendarBlock {
 
   int get safeDuration => durationDays < 1 ? 1 : durationDays;
 
-  DateTime get endDay => startDay.add(Duration(days: safeDuration - 1));
+  DateTime get endDay =>
+      DateTime(startDay.year, startDay.month, startDay.day + safeDuration - 1);
 
   bool covers(DateTime day) {
     final d = calendarDay(day);
@@ -513,7 +514,7 @@ class _GrazingCalendarBoardState extends State<GrazingCalendarBoard>
     final focus = calendarDay(widget.focusDay ?? DateTime.now());
     _days = [
       for (var i = -widget.daysBefore; i <= widget.daysAfter; i++)
-        focus.add(Duration(days: i)),
+        DateTime(focus.year, focus.month, focus.day + i),
     ];
     _focusIndex = widget.daysBefore;
   }

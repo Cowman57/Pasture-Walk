@@ -319,6 +319,9 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
         residual: resC,
         harvestedKgDm: harvested,
         durationDays: g.durationDays,
+        slotId: g.slotId,
+        areaHa: g.areaHa,
+        groupId: g.groupId,
       ),
     );
     if (!mounted) return;

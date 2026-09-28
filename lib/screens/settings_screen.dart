@@ -11,6 +11,7 @@ import '../storage.dart';
 import 'instructions_screen.dart';
 import 'activity_log_screen.dart';
 import 'farm_map_import_screen.dart';
+import 'grazing_plan_setup_screen.dart';
 import 'paddock_import_screen.dart';
 import 'paddock_ranking_screen.dart';
 import 'paddocks_edit_screen.dart';
@@ -280,8 +281,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         consider(g.at);
       }
 
-      final cleanup = await storage.cleanupDuplicateGrazingsAllPaddocks();
-      final grazingsAfter = await storage.loadAllGrazings();
+      // NOTE: Disabled automatic cleanup as it was deleting valid grazings
 
       if (!mounted) return;
       await showDialog<void>(
@@ -305,11 +305,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               'Grazings: ${grazingsBefore.length}\n'
               'Notes: ${notes.length}\n'
               '\n'
-              'Date range: $rangeText\n'
-              '\n'
-              'Duplicate grazings deleted: ${cleanup.deletedGrazings}\n'
-              'Affected paddocks: ${cleanup.affectedPaddocks}\n'
-              'Grazings after cleanup: ${grazingsAfter.length}',
+               'Date range: $rangeText',
             ),
             actions: [
               TextButton(
@@ -403,6 +399,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: const Text('Note button 2 title'),
             subtitle: Text(noteBtn2),
             onTap: () => _editNoteTitle(which: 2),
+          ),
+
+          const Divider(height: 32),
+
+          const _SectionHeader('Grazing plan'),
+          ListTile(
+            leading: const Icon(Icons.event_note),
+            title: const Text('Herds & grazing breaks'),
+            subtitle: const Text(
+              'Set up herds and the breaks they take (hours, ha target)',
+            ),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => const GrazingPlanSetupScreen(),
+              ),
+            ),
           ),
 
           const Divider(height: 32),

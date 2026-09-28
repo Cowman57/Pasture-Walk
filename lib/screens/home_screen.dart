@@ -16,7 +16,8 @@ import 'avg_cover_history_screen.dart';
 import 'grazing_accuracy_screen.dart';
 import 'grazing_schedule_preview_screen.dart';
 import 'silage_summary_screen.dart';
-import '../widgets/grazing_calendar_board.dart';
+import 'grazing_plan_setup_screen.dart';
+import '../widgets/grazing_planner.dart';
 
 const _coverHeatStops = <(double, Color)>[
   (1400, Color(0xFFD32F2F)),
@@ -337,15 +338,15 @@ class _HomeScreenState extends State<HomeScreen>
   final Set<String> selectedPaddockIds = {};
   int residual = 1600;
 
-  /// Grazings tab calendar: view by default; edit requires explicit mode.
-  bool _grazingCalEdit = false;
-  bool _grazingCalLeavePromptOpen = false;
-  List<GrazingCalendarBlock>? _grazingCalWorking;
-  ({List<GrazingCalendarBlock> blocks, double target})? _grazingCalData;
-  Future<({List<GrazingCalendarBlock> blocks, double target})>?
-      _grazingCalFuture;
-
   final Set<String> _selectedSummaryNoteIds = {};
+
+  // Selection mode for the Grazings list tab (long-press to enter).
+  final Set<String> _selectedGrazingIds = {};
+  bool _grazingListSelectionMode = false;
+  Future<List<dynamic>>? _grazingsListFuture;
+
+  /// Grazings tab: 0 = planner calendar, 1 = list.
+  int _grazingsView = 0;
 
   int _tabIndex = 0;
   int _herdFeedPage = 0;
@@ -412,189 +413,25 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _refreshHome() async {
-    _grazingCalFuture = null;
-    _grazingCalData = null;
-    if (!_grazingCalEdit) {
-      _grazingCalWorking = null;
-    }
+    _grazingsListFuture = null;
     await _load();
     if (mounted) setState(() {});
   }
 
-  Future<({List<GrazingCalendarBlock> blocks, double target})>
-      _loadGrazingCalendar() async {
-    final herds = await storage.loadHerds();
-    final allPaddocks = await storage.loadPaddocks();
-    final grazings = await storage.loadAllGrazings();
-    final pById = {for (final p in allPaddocks) p.id: p};
-    final target = Storage.totalAreaGrazedPerDayHa(herds);
-    final blocks = <GrazingCalendarBlock>[];
-    for (final g in grazings) {
-      final p = pById[g.paddockId];
-      if (p == null) continue;
-      blocks.add(
-        GrazingCalendarBlock(
-          id: g.id,
-          paddockId: g.paddockId,
-          paddockName: p.name,
-          areaHa: p.areaHa,
-          startDay: g.at,
-          durationDays: g.durationDays,
-          isDraft: false,
-          locked: false,
-          preCover: g.preCover,
-          residual: g.residual,
-          harvestedKgDm: g.harvestedKgDm,
-          enteredAt: g.enteredAt,
-        ),
-      );
-    }
-    return (blocks: blocks, target: target);
-  }
-
-  Future<({List<GrazingCalendarBlock> blocks, double target})>
-      _ensureGrazingCalFuture() {
-    return _grazingCalFuture ??= _loadGrazingCalendar().then((data) {
-      _grazingCalData = data;
-      if (mounted) setState(() {});
-      return data;
-    });
-  }
-
-  void _enterGrazingCalEdit(List<GrazingCalendarBlock> blocks) {
-    setState(() {
-      _grazingCalEdit = true;
-      _grazingCalWorking = blocks.map((b) => b.copyWith()).toList();
-    });
-  }
-
-  void _cancelGrazingCalEdit() {
-    setState(() {
-      _grazingCalEdit = false;
-      _grazingCalWorking = null;
-      _grazingCalFuture = null;
-    });
-  }
-
-  Future<bool> _promptSaveGrazingCalIfNeeded() async {
-    if (!_grazingCalEdit) return true;
-
-    final action = await showDialog<int>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Save grazings?'),
-        content: const Text(
-          'You have unsaved grazing edits. Save them before leaving this tab?',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, 2),
-            child: const Text("Don't save"),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, 0),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, 1),
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-
-    if (!mounted) return false;
-    if (action == null || action == 0) return false;
-    if (action == 1) {
-      await _saveGrazingCalEdit();
-      return mounted;
-    }
-    _cancelGrazingCalEdit();
-    return true;
-  }
-
   Future<void> _selectHomeTab(int index) async {
     if (index == _tabIndex) return;
-    if (_grazingCalLeavePromptOpen) return;
-    if (_grazingCalEdit && index != 2) {
-      _grazingCalLeavePromptOpen = true;
-      final leave = await _promptSaveGrazingCalIfNeeded();
-      _grazingCalLeavePromptOpen = false;
-      if (!leave || !mounted) return;
-    }
     setState(() {
-      if (index == 2) _grazingsTabMounted = true;
+      if (_grazingListSelectionMode) {
+        _grazingListSelectionMode = false;
+        _selectedGrazingIds.clear();
+      }
+      if (index == 2) {
+        _grazingsTabMounted = true;
+        // Clear cache when grazings tab is selected to ensure fresh data
+        _grazingsListFuture = null;
+      }
       if (index == 3) _mapTabMounted = true;
       _tabIndex = index;
-    });
-  }
-
-  Future<void> _saveGrazingCalEdit() async {
-    final working = _grazingCalWorking;
-    if (working == null) return;
-    final existing = await storage.loadAllGrazings();
-    final byId = {for (final g in existing) g.id: g};
-    final keepIds = working.map((b) => b.id).toSet();
-
-    for (final g in existing) {
-      if (!keepIds.contains(g.id)) {
-        await storage.deleteGrazingById(g.id);
-      }
-    }
-
-    for (final b in working) {
-      final prev = byId[b.id];
-      final at = DateTime(
-        b.startDay.year,
-        b.startDay.month,
-        b.startDay.day,
-        prev?.at.hour ?? 12,
-        prev?.at.minute ?? 0,
-      );
-      await storage.updateGrazing(
-        Grazing(
-          id: b.id,
-          paddockId: b.paddockId,
-          at: at,
-          enteredAt: b.enteredAt ?? prev?.enteredAt ?? at,
-          preCover: b.preCover ?? prev?.preCover ?? 2500,
-          residual: b.residual ?? prev?.residual ?? residual,
-          harvestedKgDm: b.harvestedKgDm ?? prev?.harvestedKgDm ?? 0,
-          durationDays: b.durationDays < 1 ? 1 : b.durationDays,
-        ),
-      );
-    }
-
-    if (!mounted) return;
-    setState(() {
-      _grazingCalEdit = false;
-      _grazingCalWorking = null;
-      _grazingCalFuture = null;
-    });
-    await _refreshHome();
-  }
-
-  Future<void> _deleteGrazingCalBlock(GrazingCalendarBlock b) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete grazing?'),
-        content: Text('Remove ${b.paddockName} from the schedule?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (ok != true || !mounted) return;
-    setState(() {
-      _grazingCalWorking?.removeWhere((x) => x.id == b.id);
     });
   }
 
@@ -846,6 +683,10 @@ class _HomeScreenState extends State<HomeScreen>
         .any((r) => r.paddock.shutForSilage);
     final allShutForSilage = selectedRows.isNotEmpty &&
         selectedRows.every((r) => r.paddock.shutForSilage);
+    final allSilageOrShut = selectedRows.isNotEmpty &&
+        selectedRows.every(
+          (r) => r.paddock.isSilage || r.paddock.shutForSilage,
+        );
     
     return _GrazingBar(
       residual: residual,
@@ -857,8 +698,8 @@ class _HomeScreenState extends State<HomeScreen>
       onResidualChanged: (v) => setState(() => residual = clampCover(v)),
       onUndo: selectedPaddockIds.isEmpty ? null : _undoGrazing,
       onShutForSilage: selectedPaddockIds.isEmpty ? null : _shutForSilage,
-      onOpenForGrazing: (allShutForSilage && selectedPaddockIds.isNotEmpty) 
-          ? _openForGrazing 
+      onOpenForGrazing: (allSilageOrShut && selectedPaddockIds.isNotEmpty)
+          ? _openForGrazing
           : null,
       onRecordCut: (allShutForSilage && selectedPaddockIds.isNotEmpty)
           ? _recordSilageCut
@@ -1202,7 +1043,7 @@ class _HomeScreenState extends State<HomeScreen>
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             _topNavBar(),
-            if (!selectionMode) _tabs(),
+            if (!selectionMode && !_grazingListSelectionMode) _tabs(),
             Expanded(
               child: !loaded
                   ? const Center(child: CircularProgressIndicator())
@@ -1300,11 +1141,13 @@ class _HomeScreenState extends State<HomeScreen>
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Row(
           children: [
-            if (selectionMode)
+            if (selectionMode || _grazingListSelectionMode)
               IconButton(
                 icon: const Icon(Icons.close),
                 tooltip: 'Cancel selection',
-                onPressed: _cancelSelection,
+                onPressed: selectionMode
+                    ? _cancelSelection
+                    : _cancelGrazingSelection,
               )
             else
               const SizedBox(width: 8),
@@ -1318,10 +1161,51 @@ class _HomeScreenState extends State<HomeScreen>
                   ),
                 ),
               )
+            else if (_grazingListSelectionMode)
+              Expanded(
+                child: Text(
+                  '${_selectedGrazingIds.length} selected',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w700,
+                    color: cs.onSurface,
+                  ),
+                ),
+              )
             else
               const Spacer(),
-            if (!selectionMode && _tabIndex == 2) ..._grazingCalNavActions(),
-            if (!selectionMode)
+            if (_grazingListSelectionMode) ...[
+              if (_selectedGrazingIds.isNotEmpty) ...[
+                TextButton.icon(
+                  onPressed: _editSelectedGrazings,
+                  icon: const Icon(Icons.edit_outlined, size: 18),
+                  label: const Text('Edit'),
+                ),
+                TextButton.icon(
+                  onPressed: _deleteSelectedGrazings,
+                  icon: const Icon(Icons.delete_outline, size: 18),
+                  label: const Text('Delete'),
+                ),
+              ],
+            ],
+            if (!selectionMode && !_grazingListSelectionMode) ...[
+              if (_tabIndex == 2) ...[
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 2),
+                  child: _grazingsViewSwitch(),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.event_note),
+                  tooltip: 'Grazing plan setup',
+                  onPressed: () async {
+                    await Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => const GrazingPlanSetupScreen(),
+                      ),
+                    );
+                    await _refreshHome();
+                  },
+                ),
+              ],
               IconButton(
                 icon: const Icon(Icons.settings_outlined),
                 tooltip: 'Settings',
@@ -1332,40 +1216,13 @@ class _HomeScreenState extends State<HomeScreen>
                   await _refreshHome();
                 },
               ),
+            ],
           ],
         ),
       ),
     );
   }
 
-  List<Widget> _grazingCalNavActions() {
-    if (_grazingCalEdit) {
-      return [
-        TextButton(
-          onPressed: _cancelGrazingCalEdit,
-          child: const Text('Cancel'),
-        ),
-        const SizedBox(width: 4),
-        FilledButton(
-          onPressed: _saveGrazingCalEdit,
-          child: const Text('Save'),
-        ),
-        const SizedBox(width: 4),
-      ];
-    }
-
-    final blocks = _grazingCalData?.blocks;
-    return [
-      TextButton.icon(
-        onPressed: blocks == null
-            ? null
-            : () => _enterGrazingCalEdit(blocks),
-        icon: const Icon(Icons.edit_outlined, size: 18),
-        label: const Text('Edit'),
-      ),
-      const SizedBox(width: 4),
-    ];
-  }
 
   Widget _tabs() {
     final cs = Theme.of(context).colorScheme;
@@ -2377,8 +2234,10 @@ int _calculateAveragePredicted(List<_RowData> rows) {
         final today = DateTime(now.year, now.month, now.day);
         final start = today.subtract(const Duration(days: 6));
 
-        double areaWeek = 0.0;
-        var harvestedWeek = 0;
+        // Collapse per day/paddock so a paddock in two slots on a day is split,
+        // not counted twice.
+        final areaShares = <DateTime, Map<String, List<double>>>{};
+        final harvestShares = <DateTime, Map<String, List<double>>>{};
         for (final g in grazings) {
           if (g.at.isAfter(now)) continue;
           final p = pById[g.paddockId];
@@ -2386,14 +2245,27 @@ int _calculateAveragePredicted(List<_RowData> rows) {
           forEachGrazingAllocationDay(
             g.at,
             g.durationDays,
-            areaHa: p.areaHa,
+            areaHa: g.areaHa ?? p.areaHa,
             harvestedKgDm: g.harvestedKgDm.toDouble(),
             fn: (day, area, harvest) {
               if (day.isBefore(start) || day.isAfter(today)) return;
-              areaWeek += area;
-              harvestedWeek += harvest.round();
+              ((areaShares[day] ??= {})[p.id] ??= []).add(area);
+              ((harvestShares[day] ??= {})[p.id] ??= []).add(harvest);
             },
           );
+        }
+        double avg(List<double> xs) => xs.reduce((a, b) => a + b) / xs.length;
+        var areaWeek = 0.0;
+        for (final byP in areaShares.values) {
+          for (final xs in byP.values) {
+            areaWeek += avg(xs);
+          }
+        }
+        var harvestedWeek = 0;
+        for (final byP in harvestShares.values) {
+          for (final xs in byP.values) {
+            harvestedWeek += avg(xs).round();
+          }
         }
         final actualAreaPerDay = areaWeek / 7.0;
 
@@ -2435,7 +2307,7 @@ int _calculateAveragePredicted(List<_RowData> rows) {
                                     ),
                                   ),
                                   InkWell(
-                                    onTap: _editHerds,
+                                    onTap: _openGrazingPlanSetup,
                                     child: const Padding(
                                       padding: EdgeInsets.all(2),
                                       child: Icon(
@@ -2451,7 +2323,7 @@ int _calculateAveragePredicted(List<_RowData> rows) {
                               Expanded(
                                 child: herds.isEmpty
                                     ? InkWell(
-                                        onTap: _editHerds,
+                                        onTap: _openGrazingPlanSetup,
                                         child: const Align(
                                           alignment: Alignment.centerLeft,
                                           child: Text(
@@ -2680,251 +2552,6 @@ int _calculateAveragePredicted(List<_RowData> rows) {
         ],
       ),
     );
-  }
-
-  Future<void> _editHerds() async {
-    final existing = await storage.loadHerds();
-    if (!mounted) return;
-
-    final drafts = existing
-        .map(
-          (h) => _HerdDraft(
-            id: h.id,
-            nameCtrl: TextEditingController(text: h.name),
-            cowsCtrl: TextEditingController(
-              text: h.cowCount <= 0 ? '' : '${h.cowCount}',
-            ),
-            areaCtrl: TextEditingController(
-              text: h.areaGrazedPerDayHa <= 0
-                  ? ''
-                  : h.areaGrazedPerDayHa.toStringAsFixed(2),
-            ),
-            suppCtrl: TextEditingController(
-              text: h.supplementKgDmPerCowPerDay <= 0
-                  ? ''
-                  : h.supplementKgDmPerCowPerDay.toStringAsFixed(1),
-            ),
-          ),
-        )
-        .toList();
-
-    if (drafts.isEmpty) {
-      drafts.add(
-        _HerdDraft(
-          id: 'herd_milkers',
-          nameCtrl: TextEditingController(text: 'Milkers'),
-          cowsCtrl: TextEditingController(),
-          areaCtrl: TextEditingController(),
-          suppCtrl: TextEditingController(),
-        ),
-      );
-    }
-
-    List<Herd>? result;
-    try {
-      result = await showDialog<List<Herd>>(
-        context: context,
-        builder: (ctx) {
-          return StatefulBuilder(
-            builder: (ctx, setLocal) {
-              List<Herd>? parseDrafts() {
-                final saved = <Herd>[];
-                for (final d in drafts) {
-                  final name = d.nameCtrl.text.trim().isEmpty
-                      ? 'Herd'
-                      : d.nameCtrl.text.trim();
-                  final cowsText = d.cowsCtrl.text.trim();
-                  final areaText = d.areaCtrl.text.trim();
-                  final suppText = d.suppCtrl.text.trim();
-                  final cows =
-                      cowsText.isEmpty ? 0 : int.tryParse(cowsText);
-                  final area = areaText.isEmpty
-                      ? 0.0
-                      : double.tryParse(areaText);
-                  final supp = suppText.isEmpty
-                      ? 0.0
-                      : double.tryParse(suppText);
-                  if (cows == null ||
-                      cows < 0 ||
-                      area == null ||
-                      area < 0 ||
-                      supp == null ||
-                      supp < 0) {
-                    return null;
-                  }
-                  saved.add(
-                    Herd(
-                      id: d.id,
-                      name: name,
-                      cowCount: cows,
-                      areaGrazedPerDayHa: area,
-                      supplementKgDmPerCowPerDay: supp,
-                    ),
-                  );
-                }
-                return saved.isEmpty ? null : saved;
-              }
-
-              return AlertDialog(
-                title: const Text('Herds'),
-                content: SizedBox(
-                  width: double.maxFinite,
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      maxHeight: MediaQuery.sizeOf(ctx).height * 0.55,
-                    ),
-                    child: SingleChildScrollView(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          for (var i = 0; i < drafts.length; i++) ...[
-                            if (i > 0) const SizedBox(height: 12),
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    'Herd ${i + 1}',
-                                    style: const TextStyle(
-                                      fontWeight: FontWeight.w800,
-                                      fontSize: 13,
-                                    ),
-                                  ),
-                                ),
-                                if (drafts.length > 1)
-                                  IconButton(
-                                    tooltip: 'Remove herd',
-                                    onPressed: () {
-                                      final removed = drafts.removeAt(i);
-                                      setLocal(() {});
-                                      WidgetsBinding.instance
-                                          .addPostFrameCallback((_) {
-                                        removed.dispose();
-                                      });
-                                    },
-                                    icon: const Icon(Icons.delete_outline),
-                                  ),
-                              ],
-                            ),
-                            const SizedBox(height: 6),
-                            TextField(
-                              controller: drafts[i].nameCtrl,
-                              decoration: const InputDecoration(
-                                labelText: 'Name',
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            TextField(
-                              controller: drafts[i].cowsCtrl,
-                              keyboardType: TextInputType.number,
-                              decoration: const InputDecoration(
-                                labelText: 'Cows',
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            TextField(
-                              controller: drafts[i].areaCtrl,
-                              keyboardType:
-                                  const TextInputType.numberWithOptions(
-                                decimal: true,
-                              ),
-                              decoration: const InputDecoration(
-                                labelText: 'Area grazed (ha/day)',
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            TextField(
-                              controller: drafts[i].suppCtrl,
-                              keyboardType:
-                                  const TextInputType.numberWithOptions(
-                                decimal: true,
-                              ),
-                              decoration: const InputDecoration(
-                                labelText: 'Supplement (kgDM/cow/day)',
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
-                          ],
-                          const SizedBox(height: 12),
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: TextButton.icon(
-                              onPressed: () {
-                                setLocal(() {
-                                  drafts.add(
-                                    _HerdDraft(
-                                      id:
-                                          'herd_${DateTime.now().millisecondsSinceEpoch}',
-                                      nameCtrl: TextEditingController(
-                                        text: drafts.any(
-                                              (d) =>
-                                                  d.nameCtrl.text
-                                                      .trim()
-                                                      .toLowerCase() ==
-                                                  'dry',
-                                            )
-                                            ? 'Herd ${drafts.length + 1}'
-                                            : 'Dry',
-                                      ),
-                                      cowsCtrl: TextEditingController(),
-                                      areaCtrl: TextEditingController(),
-                                      suppCtrl: TextEditingController(),
-                                    ),
-                                  );
-                                });
-                              },
-                              icon: const Icon(Icons.add),
-                              label: const Text('Add herd'),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(ctx),
-                    child: const Text('Cancel'),
-                  ),
-                  ElevatedButton(
-                    onPressed: () {
-                      final saved = parseDrafts();
-                      if (saved == null) {
-                        ScaffoldMessenger.of(ctx).showSnackBar(
-                          const SnackBar(
-                            content: Text(
-                              'Check herd cows and area values.',
-                            ),
-                          ),
-                        );
-                        return;
-                      }
-                      Navigator.pop(ctx, saved);
-                    },
-                    child: const Text('Save'),
-                  ),
-                ],
-              );
-            },
-          );
-        },
-      );
-    } finally {
-      final toDispose = List<_HerdDraft>.from(drafts);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        for (final d in toDispose) {
-          d.dispose();
-        }
-      });
-    }
-
-    if (result == null || !mounted) return;
-    await storage.saveHerds(result);
-    if (!mounted) return;
-    await _refreshHome();
   }
 
   Widget _summaryNotes() {
@@ -3548,7 +3175,15 @@ int _calculateAveragePredicted(List<_RowData> rows) {
   }
 
   Future<void> _editAreaGrazedPerDay() async {
-    await _editHerds();
+    await _openGrazingPlanSetup();
+  }
+
+  /// Single source of truth for herds + breaks (slots).
+  Future<void> _openGrazingPlanSetup() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const GrazingPlanSetupScreen()),
+    );
+    await _refreshHome();
   }
 
   Future<void> _editTrendTimescale() async {
@@ -3703,39 +3338,472 @@ int _calculateAveragePredicted(List<_RowData> rows) {
     );
   }
 
-  /// Farm-wide grazings on the shared calendar board (view until Edit).
-  Widget _grazingsTab(List<_RowData> _) {
-    return FutureBuilder<({List<GrazingCalendarBlock> blocks, double target})>(
-      future: _ensureGrazingCalFuture(),
+Widget _grazingsTab(List<_RowData> rows) {
+    return _grazingsView == 0
+        ? GrazingPlanner(
+            storage: storage,
+            palettePaddocks: [
+              for (final r in rows)
+                if (r.paddock.includeInRotation &&
+                    !r.paddock.isSilage &&
+                    !r.paddock.shutForSilage)
+                  PlannerPaddock(
+                    id: r.paddock.id,
+                    name: r.paddock.name,
+                    areaHa: r.paddock.areaHa,
+                    predictedCover: r.predicted,
+                    lastAt: r.lastAt,
+                  ),
+            ],
+            onChanged: _refreshHome,
+          )
+        : _grazingsListView();
+  }
+
+  Widget _grazingsViewSwitch() {
+    return SegmentedButton<int>(
+      segments: const [
+        ButtonSegment(
+          value: 0,
+          icon: Icon(Icons.calendar_view_week, size: 16),
+        ),
+        ButtonSegment(
+          value: 1,
+          icon: Icon(Icons.list, size: 16),
+        ),
+      ],
+      selected: {_grazingsView},
+      showSelectedIcon: false,
+      style: const ButtonStyle(
+        visualDensity: VisualDensity.compact,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        padding: WidgetStatePropertyAll(
+          EdgeInsets.symmetric(horizontal: 6),
+        ),
+      ),
+      onSelectionChanged: (s) => setState(() => _grazingsView = s.first),
+    );
+  }
+
+  Widget _grazingsListView() {
+    return FutureBuilder<List<dynamic>>(
+      future: _grazingsListFuture ??= Future.wait([
+        storage.loadAllGrazings(),
+        storage.loadPaddocks(),
+        storage.loadHerds(),
+        storage.loadGrazingSlots(),
+      ]),
       builder: (context, snap) {
         if (!snap.hasData) {
           return const Center(child: CircularProgressIndicator());
         }
-        final data = snap.data!;
-        final blocks = _grazingCalEdit
-            ? (_grazingCalWorking ?? data.blocks)
-            : data.blocks;
+        final allGrazings = snap.data![0] as List<Grazing>;
+        final allPaddocks = snap.data![1] as List<Paddock>;
+        final allHerds = snap.data![2] as List<Herd>;
+        final allSlots = snap.data![3] as List<GrazingSlot>;
+        final pById = {for (final p in allPaddocks) p.id: p};
+        final slotLabels = _slotLabelMap(allHerds, allSlots);
 
-        return Padding(
-          padding: const EdgeInsets.fromLTRB(6, 6, 6, 0),
-          child: GrazingCalendarBoard(
-            key: ValueKey('gcal_edit_$_grazingCalEdit'),
-            blocks: blocks,
-            targetHaDay: data.target,
-            interaction: _grazingCalEdit
-                ? GrazingCalendarInteraction.edit
-                : GrazingCalendarInteraction.view,
-            onBlocksChanged: _grazingCalEdit
-                ? (next) {
-                    setState(() => _grazingCalWorking = [...next]);
-                  }
-                : null,
-            onBlockLongPress:
-                _grazingCalEdit ? _deleteGrazingCalBlock : null,
-          ),
+        if (allGrazings.isEmpty) {
+          return const Center(child: Text('No grazings recorded yet.'));
+        }
+
+        final now = DateTime.now();
+        final futureGrazings = allGrazings.where((g) => g.at.isAfter(now)).toList()
+          ..sort((a, b) => a.at.compareTo(b.at));
+        final pastGrazings = allGrazings.where((g) => !g.at.isAfter(now)).toList()
+          ..sort((a, b) => b.at.compareTo(a.at));
+
+        final children = <Widget>[];
+
+        if (futureGrazings.isNotEmpty) {
+          children.add(_grazingSectionHeader('Scheduled / Future (${futureGrazings.length})'));
+          for (var i = 0; i < futureGrazings.length; i++) {
+            children.add(_grazingRow(futureGrazings[i], pById, slotLabels, isFuture: true));
+            if (i < futureGrazings.length - 1) {
+              children.add(const Divider(height: 1));
+            }
+          }
+        }
+
+        if (pastGrazings.isNotEmpty) {
+          if (futureGrazings.isNotEmpty) {
+            children.add(const SizedBox(height: 8));
+          }
+          children.add(_grazingSectionHeader('Past (${pastGrazings.length})'));
+          for (var i = 0; i < pastGrazings.length; i++) {
+            children.add(_grazingRow(pastGrazings[i], pById, slotLabels, isFuture: false));
+            if (i < pastGrazings.length - 1) {
+              children.add(const Divider(height: 1));
+            }
+          }
+        }
+
+        return Column(
+          children: [
+            _grazingListHeader(),
+            const Divider(height: 1),
+            Expanded(
+              child: ListView(
+                padding: EdgeInsets.zero,
+                children: children,
+              ),
+            ),
+          ],
         );
       },
     );
+  }
+
+  /// slotId -> "Herd · Slot" for display.
+  Map<String, String> _slotLabelMap(List<Herd> herds, List<GrazingSlot> slots) {
+    final herdById = {for (final h in herds) h.id: h};
+    final out = <String, String>{};
+    for (final s in slots) {
+      final herd = herdById[s.herdId];
+      out[s.id] = herd == null ? s.label : '${herd.name} · ${s.label}';
+    }
+    return out;
+  }
+
+
+  Widget _grazingSectionHeader(String title) {
+    return Container(
+      width: double.infinity,
+      color: Colors.grey.shade200,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Text(
+        title,
+        style: const TextStyle(
+          fontWeight: FontWeight.w800,
+          fontSize: 12,
+          letterSpacing: 0.4,
+        ),
+      ),
+    );
+  }
+
+  Widget _grazingListHeader() {
+    const style = TextStyle(
+      fontSize: 11,
+      fontWeight: FontWeight.w700,
+      color: Colors.black87,
+    );
+    return Container(
+      color: Colors.white,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Row(
+        children: [
+          const SizedBox(width: 18),
+          const Expanded(
+            flex: 2,
+            child: Text('Date', style: style, textAlign: TextAlign.center),
+          ),
+          const Expanded(
+            flex: 3,
+            child: Text('Paddock', style: style, textAlign: TextAlign.center),
+          ),
+          const Expanded(
+            child: Text('Pre', style: style, textAlign: TextAlign.center),
+          ),
+          const Expanded(
+            child: Text('Post', style: style, textAlign: TextAlign.center),
+          ),
+          const Expanded(
+            child: Text('Harvest', style: style, textAlign: TextAlign.center),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _grazingRow(
+    Grazing g,
+    Map<String, Paddock> pById,
+    Map<String, String> slotLabels, {
+    required bool isFuture,
+  }) {
+    final dateStr = DateFormat('dd MMM yy').format(g.at);
+    final p = pById[g.paddockId];
+    final selected = _selectedGrazingIds.contains(g.id);
+    final selecting = _grazingListSelectionMode;
+    final breakLabel = g.slotId == null
+        ? 'Unassigned'
+        : (slotLabels[g.slotId] ?? 'Unknown break');
+    final area = g.areaHa ?? p?.areaHa;
+
+    return InkWell(
+      onTap: selecting ? () => _toggleGrazingSelection(g.id) : null,
+      onLongPress: () => _enterGrazingSelection(g.id),
+      child: Container(
+        color: selected ? Colors.blue.withValues(alpha: 0.12) : null,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Row(
+          children: [
+            if (selecting)
+              SizedBox(
+                width: 22,
+                child: Icon(
+                  selected ? Icons.check_circle : Icons.radio_button_unchecked,
+                  size: 18,
+                  color: selected ? Colors.blue : Colors.grey,
+                ),
+              )
+            else
+              Icon(
+                isFuture ? Icons.schedule : Icons.check_circle_outline,
+                size: 14,
+                color: isFuture ? Colors.blue : Colors.green,
+              ),
+            const SizedBox(width: 4),
+            Expanded(
+              flex: 2,
+              child: Text(dateStr, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: isFuture ? Colors.blue.shade700 : Colors.black87)),
+            ),
+            Expanded(
+              flex: 3,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    p?.name ?? '[${g.paddockId.substring(0, 8)}]',
+                    style: const TextStyle(fontSize: 13),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  Text(
+                    '$breakLabel${area == null ? '' : '  ·  ${area.toStringAsFixed(2)} ha'}',
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: g.slotId == null
+                          ? Colors.orange.shade800
+                          : Colors.black.withValues(alpha: 0.55),
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: Text(g.preCover.toString(), style: const TextStyle(fontSize: 13), textAlign: TextAlign.right),
+            ),
+            Expanded(
+              child: Text(g.residual.toString(), style: const TextStyle(fontSize: 13), textAlign: TextAlign.right),
+            ),
+            Expanded(
+              child: Text(g.harvestedKgDm.toString(), style: const TextStyle(fontSize: 13), textAlign: TextAlign.right),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _enterGrazingSelection(String id) {
+    setState(() {
+      _grazingListSelectionMode = true;
+      _selectedGrazingIds.add(id);
+    });
+  }
+
+  void _toggleGrazingSelection(String id) {
+    setState(() {
+      if (_selectedGrazingIds.contains(id)) {
+        _selectedGrazingIds.remove(id);
+        if (_selectedGrazingIds.isEmpty) {
+          _grazingListSelectionMode = false;
+        }
+      } else {
+        _selectedGrazingIds.add(id);
+      }
+    });
+  }
+
+  void _cancelGrazingSelection() {
+    setState(() {
+      _grazingListSelectionMode = false;
+      _selectedGrazingIds.clear();
+    });
+  }
+
+  Future<void> _deleteSelectedGrazings() async {
+    if (_selectedGrazingIds.isEmpty) return;
+    final count = _selectedGrazingIds.length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete grazings?'),
+        content: Text(
+          'Remove $count selected grazing${count == 1 ? '' : 's'}? This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final ids = _selectedGrazingIds.toList();
+    for (final id in ids) {
+      await storage.deleteGrazingById(id);
+    }
+    if (!mounted) return;
+    _cancelGrazingSelection();
+    await _refreshHome();
+  }
+
+  Future<void> _editSelectedGrazings() async {
+    if (_selectedGrazingIds.isEmpty) return;
+    final preCtrl = TextEditingController();
+    final resCtrl = TextEditingController();
+    final areaCtrl = TextEditingController();
+    final count = _selectedGrazingIds.length;
+
+    final herds = await storage.loadHerds();
+    final slots = await storage.loadGrazingSlots();
+    if (!mounted) return;
+    final herdById = {for (final h in herds) h.id: h};
+    const keepSlot = '__keep__';
+    const unassignSlot = '__unassigned__';
+    String selectedSlot = keepSlot;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: Text('Edit $count grazing${count == 1 ? '' : 's'}'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('Leave a field blank to keep the existing value.'),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: preCtrl,
+                  decoration: const InputDecoration(labelText: 'Pre (kgDM/ha)'),
+                  keyboardType: TextInputType.number,
+                ),
+                TextField(
+                  controller: resCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Post / residual (kgDM/ha)',
+                  ),
+                  keyboardType: TextInputType.number,
+                ),
+                TextField(
+                  controller: areaCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Area grazed (ha)',
+                    helperText: 'Blank keeps existing; enables split paddocks',
+                  ),
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<String>(
+                  initialValue: selectedSlot,
+                  isExpanded: true,
+                  decoration: const InputDecoration(labelText: 'Break (herd · slot)'),
+                  items: [
+                    const DropdownMenuItem(
+                      value: keepSlot,
+                      child: Text('— Keep existing —'),
+                    ),
+                    const DropdownMenuItem(
+                      value: unassignSlot,
+                      child: Text('Unassigned'),
+                    ),
+                    for (final s in slots)
+                      DropdownMenuItem(
+                        value: s.id,
+                        child: Text(
+                          '${herdById[s.herdId]?.name ?? '?'} · ${s.label}',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                  ],
+                  onChanged: (v) =>
+                      setLocal(() => selectedSlot = v ?? keepSlot),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Apply'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    final preText = preCtrl.text.trim();
+    final resText = resCtrl.text.trim();
+    final areaText = areaCtrl.text.trim();
+    final newPre = preText.isEmpty ? null : clampCover(int.tryParse(preText) ?? 0);
+    final newRes = resText.isEmpty ? null : clampCover(int.tryParse(resText) ?? 0);
+    final newArea = areaText.isEmpty
+        ? null
+        : double.tryParse(areaText)?.clamp(0.0, 999999999.0);
+    final newSlot = selectedSlot == keepSlot
+        ? null
+        : (selectedSlot == unassignSlot ? '' : selectedSlot);
+    if (newPre == null &&
+        newRes == null &&
+        newArea == null &&
+        newSlot == null) {
+      return;
+    }
+
+    final all = await storage.loadAllGrazings();
+    final paddocks = await storage.loadPaddocks();
+    final pById = {for (final p in paddocks) p.id: p};
+
+    for (final g in all) {
+      if (!_selectedGrazingIds.contains(g.id)) continue;
+      final pre = newPre ?? g.preCover;
+      final res = newRes ?? g.residual;
+      final areaHa = newArea ?? g.areaHa;
+      final area = areaHa ?? pById[g.paddockId]?.areaHa ?? 0;
+      final harvested = area <= 0
+          ? g.harvestedKgDm
+          : ((pre - res) * area).round().clamp(0, 999999999);
+      await storage.updateGrazing(
+        Grazing(
+          id: g.id,
+          paddockId: g.paddockId,
+          at: g.at,
+          enteredAt: g.enteredAt,
+          preCover: pre,
+          residual: res,
+          harvestedKgDm: harvested,
+          durationDays: g.durationDays,
+          slotId: newSlot == null
+              ? g.slotId
+              : (newSlot.isEmpty ? null : newSlot),
+          areaHa: areaHa,
+          groupId: g.groupId,
+        ),
+      );
+    }
+
+    if (!mounted) return;
+    _cancelGrazingSelection();
+    await _refreshHome();
   }
 
   Widget _stickyHeader() {
@@ -3985,29 +4053,6 @@ class _WedgePaddock {
   final String label;
   final int cover;
   const _WedgePaddock({required this.label, required this.cover});
-}
-
-class _HerdDraft {
-  final String id;
-  final TextEditingController nameCtrl;
-  final TextEditingController cowsCtrl;
-  final TextEditingController areaCtrl;
-  final TextEditingController suppCtrl;
-
-  _HerdDraft({
-    required this.id,
-    required this.nameCtrl,
-    required this.cowsCtrl,
-    required this.areaCtrl,
-    required this.suppCtrl,
-  });
-
-  void dispose() {
-    nameCtrl.dispose();
-    cowsCtrl.dispose();
-    areaCtrl.dispose();
-    suppCtrl.dispose();
-  }
 }
 
 class _FeedWedge extends StatelessWidget {

@@ -6,7 +6,7 @@ class InstructionsScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('How to use Pasture Walk')),
+      appBar: AppBar(title: const Text('How to use PastureWalk')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: const [
@@ -21,6 +21,15 @@ class InstructionsScreen extends StatelessWidget {
             'Open Recording order to set the order you will walk paddocks in.',
             'Turn Include in rotation OFF for paddocks that are cropped or should not affect farm averages.',
             'Excluded paddocks will not appear in Recording and are ignored in Summary calculations.',
+          ]),
+          _H2('Grazing plan setup (herds & breaks)'),
+          _P(
+            'Settings → Grazing plan (or the event-note icon on the Grazings tab) opens Herds & grazing breaks.',
+          ),
+          _Bullets([
+            'Add each herd with its cows and its Daily target — enter it as ha/day or as m²/cow/day (the two are linked by cow count). This daily target is the only area target; breaks do not have their own targets.',
+            'Add the breaks (slots) a herd takes: a label (e.g. AM, PM, Night) and the hours in the break.',
+            'The planner compares each day’s total allocated area against the sum of the herds’ daily targets.',
           ]),
 
           _H1('2) Record covers (Start / Resume Recording)'),
@@ -43,8 +52,8 @@ class InstructionsScreen extends StatelessWidget {
           _Bullets([
             'Shows farm KPIs, the feed wedge, and recent notes.',
             'Swipe Avg cover: last walk (actual covers + days since) or expected from predicted covers. Tap the card for history.',
-            'Herds (e.g. Milkers, Dry): each has cows, area grazed/day, and optional supplement kgDM/cow/day. Swipe the kgDM/cow/day card for each herd (pasture / supplement / total). Round length uses the sum of herd areas.',
-            'Tap Grazing accuracy for history (default: last 7 days + planned). Stacked daily paddock bars (area or harvest) colour green below target and red/orange above. Target changes are stored for the orange line. Edit herds via the pencil on kgDM/cow/day.',
+            'Herds (e.g. Milkers, Dry): each has cows, a daily target area, and optional supplement kgDM/cow/day. The daily target can be entered as ha/day or m²/cow/day. Swipe the kgDM/cow/day card for each herd (pasture / supplement / total). Round length uses the sum of herd areas.',
+            'Tap Grazing accuracy for history (default: last 7 days + planned). Stacked daily paddock bars (area or harvest) colour green below target and red/orange above. Target changes are stored for the orange line. Edit herds/breaks via the pencil on kgDM/cow/day (opens Grazing plan setup).',
             'You can clear notes from the Summary list (notes remain in paddock history).',
           ]),
           _H2('Paddocks tab'),
@@ -56,9 +65,13 @@ class InstructionsScreen extends StatelessWidget {
           ]),
           _H2('Grazings tab'),
           _Bullets([
-            'Calendar of past and upcoming grazings (scroll up/down). Day column shows % of herd target ha/day (green ≤100%, red over).',
-            'View-only until Edit. Tap a paddock to select it for adjustment, then drag it up/down to snap between days; drag the bottom handle to extend duration; × to delete. Unselected paddocks scroll with the calendar.',
-            'Scheduling new grazings from Paddocks uses the same board as a draft (Confirm & Save).',
+            'Planner | List toggle lives in the top bar.',
+            'Planner is a timesheet grid: days run down (frozen Date column on the left), breaks run across (frozen herd/break header on top). Drag empty areas to pan; zoom buttons change how many whole columns are shown (your zoom is remembered).',
+            'The Date cell background is a target meter: it fills green within ±10% of the day’s target, orange near, red further off; over-target fills back in from the right in red.',
+            'Drag a paddock from the bottom palette (sorted by highest predicted cover) onto a cell to schedule it. A dropped paddock stays selected so you can extend it or drag it to move.',
+            'Tap a placed box to select it — greyed ＋ boxes appear on adjacent days/breaks; tap them to extend, tap a covered box to shrink (a grazing keeps at least one box). Drag a selected box to move it. Long-press a box for its details (edit/delete).',
+            'When a paddock is selected, pan from the Date column or the title bar so you don’t move grazings by accident.',
+            'The List view is a flat, date-ordered list; long-press rows for multi-select edit/delete.',
           ]),
           _H2('Map tab'),
           _Bullets([
@@ -80,15 +93,15 @@ class InstructionsScreen extends StatelessWidget {
             'You can rename the two preset note buttons in Settings (e.g. “Weeds”, “Water leak”).',
           ),
 
-          _H1('5) Enter grazings'),
+          _H1('5) Plan grazings'),
           _P(
-            'From Home → Paddocks tab, long-press a paddock to enter selection mode, select one or more paddocks, set the residual, then Preview. The schedule board is a draft of the same calendar used on the Grazings tab — tap a draft block to select it, then drag between days or resize the bottom edge, then Confirm & Save. On Grazings, browse in view mode; tap Edit, tap a paddock to adjust, then Save.',
+            'The Grazings tab Planner is the main way to plan and record grazings. Drag paddocks from the bottom palette onto a break/day to place them; select a placed box to extend it into adjacent days/breaks or drag it to another slot. Set up herds and breaks first in Grazing plan setup.',
           ),
           _Bullets([
-            'Pre cover is the paddock’s predicted cover at the time you save the grazing.',
-            'Residual is what you entered in the grazing bar.',
+            'Pre cover defaults to the paddock’s predicted cover; post/residual defaults to the feed-wedge residual. Edit these (and area/days) from a box’s details by long-pressing it.',
             'Harvested kgDM = (pre - residual) × area.',
-            'Undo grazing removes grazings saved in the last 24 hours for selected paddocks.',
+            'Multi-day runs spread their area across the days; a paddock in two breaks on one day is split so it counts once that day.',
+            'Undo grazing (from the Paddocks selection bar) removes grazings saved in the last 24 hours for selected paddocks.',
           ]),
 
           _H1('6) Backup & restore'),

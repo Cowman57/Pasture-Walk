@@ -22,6 +22,8 @@ class Storage {
   static const _hiddenSummaryNoteIdsKey = 'hidden_summary_note_ids';
 
   static const _silageCutsKey = 'silage_cuts';
+  static const _grazingSlotsKey = 'grazing_slots_json';
+  static const _calendarVisibleColsKey = 'calendar_visible_cols';
 
   // v2.0.0 Map/GPS keys
   static const _gpsMeasuringEnabledKey = 'gps_measuring_enabled';
@@ -340,6 +342,54 @@ class Storage {
     return herds.fold<double>(0.0, (sum, h) => sum + h.areaGrazedPerDayHa);
   }
 
+  // -----------------------------
+  // GRAZING PLAN SLOTS
+  // -----------------------------
+  Future<List<GrazingSlot>> loadGrazingSlots() async {
+    final sp = await SharedPreferences.getInstance();
+    final raw = sp.getString(_grazingSlotsKey);
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      final list = jsonDecode(raw) as List;
+      final out = list
+          .whereType<Map>()
+          .map((e) => GrazingSlot.fromMap(Map<String, dynamic>.from(e)))
+          .toList();
+      out.sort((a, b) => a.sortOrder.compareTo(b.sortOrder));
+      return out;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> saveGrazingSlots(List<GrazingSlot> slots) async {
+    final sp = await SharedPreferences.getInstance();
+    final cleaned = [
+      for (var i = 0; i < slots.length; i++)
+        slots[i].copyWith(sortOrder: i),
+    ];
+    await sp.setString(
+      _grazingSlotsKey,
+      jsonEncode(cleaned.map((s) => s.toMap()).toList()),
+    );
+  }
+
+  Future<List<GrazingSlot>> slotsForHerd(String herdId) async {
+    final all = await loadGrazingSlots();
+    return all.where((s) => s.herdId == herdId).toList();
+  }
+
+  // Planner column-width zoom (number of visible break columns).
+  Future<int?> loadCalendarVisibleCols() async {
+    final sp = await SharedPreferences.getInstance();
+    return sp.getInt(_calendarVisibleColsKey);
+  }
+
+  Future<void> saveCalendarVisibleCols(int v) async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setInt(_calendarVisibleColsKey, v.clamp(1, 12));
+  }
+
   Future<List<HerdTargetSnapshot>> loadHerdTargetHistory() async {
     final sp = await SharedPreferences.getInstance();
     final raw = sp.getString(_herdTargetHistoryKey);
@@ -454,8 +504,12 @@ class Storage {
     final sp = await SharedPreferences.getInstance();
     final raw = sp.getString(_paddocksKey);
     if (raw == null) return [];
-    final list = jsonDecode(raw) as List;
-    return list.map((e) => Paddock.fromMap(e)).toList();
+    try {
+      final list = jsonDecode(raw) as List;
+      return list.map((e) => Paddock.fromMap(e)).toList();
+    } catch (_) {
+      return [];
+    }
   }
 
   Future<void> savePaddocks(List<Paddock> paddocks) async {
@@ -496,8 +550,12 @@ class Storage {
     final sp = await SharedPreferences.getInstance();
     final raw = sp.getString(_measurementsKey);
     if (raw == null) return [];
-    final list = jsonDecode(raw) as List;
-    return list.map((e) => Measurement.fromMap(e)).toList();
+    try {
+      final list = jsonDecode(raw) as List;
+      return list.map((e) => Measurement.fromMap(e)).toList();
+    } catch (_) {
+      return [];
+    }
   }
 
   Future<void> _saveMeasurements(List<Measurement> ms) async {
@@ -563,7 +621,11 @@ class Storage {
     for (final g in allGrazings) {
       if (g.paddockId != paddockId || g.at.isAfter(asOf)) continue;
       
-      final grazingEnd = g.at.add(Duration(days: g.durationDays - 1));
+      final grazingEnd = DateTime(
+        g.at.year,
+        g.at.month,
+        g.at.day + (g.durationDays - 1),
+      );
       final isDuring = !asOf.isBefore(g.at) && !asOf.isAfter(grazingEnd);
       
       if (isDuring) {
@@ -666,8 +728,12 @@ class Storage {
     final sp = await SharedPreferences.getInstance();
     final raw = sp.getString(_notesKey);
     if (raw == null) return [];
-    final list = jsonDecode(raw) as List;
-    return list.map((e) => NoteEntry.fromMap(e)).toList();
+    try {
+      final list = jsonDecode(raw) as List;
+      return list.map((e) => NoteEntry.fromMap(e)).toList();
+    } catch (_) {
+      return [];
+    }
   }
 
   Future<void> _saveNotes(List<NoteEntry> ns) async {
@@ -740,25 +806,37 @@ class Storage {
     final sp = await SharedPreferences.getInstance();
     final raw = sp.getString(_grazingsKey);
     if (raw == null) return [];
-    final list = jsonDecode(raw) as List;
-    return list.map((e) => Grazing.fromMap(e)).toList();
+    try {
+      final list = jsonDecode(raw) as List;
+      return list.map((e) => Grazing.fromMap(e)).toList();
+    } catch (_) {
+      return [];
+    }
   }
 
   Future<void> _saveGrazings(List<Grazing> all) async {
     final sp = await SharedPreferences.getInstance();
-    await sp.setString(
-      _grazingsKey,
-      jsonEncode(all.map((x) => x.toMap()).toList()),
-    );
+    try {
+      await sp.setString(
+        _grazingsKey,
+        jsonEncode(all.map((x) => x.toMap()).toList()),
+      );
+    } catch (_) {
+      // Log error silently - at least don't crash
+    }
   }
 
   /// KPIs helper: raw load all
   Future<List<Grazing>> loadAllGrazings() async => _loadGrazings();
 
   Future<void> appendGrazing(Grazing g) async {
-    final all = await _loadGrazings();
-    all.add(g);
-    await _saveGrazings(all);
+    try {
+      final all = await _loadGrazings();
+      all.add(g);
+      await _saveGrazings(all);
+    } catch (_) {
+      // Log error silently
+    }
   }
 
   Future<void> deleteGrazingById(String id) async {
@@ -825,6 +903,36 @@ class Storage {
     final all = await _loadGrazings();
     return all.where((g) => g.paddockId == paddockId).toList()
       ..sort((a, b) => b.at.compareTo(a.at));
+  }
+
+  /// Clears the slot link on any grazing that references one of [slotIds].
+  /// Used when a herd (and its breaks) is deleted so records become unassigned
+  /// rather than orphaned. Returns how many records changed.
+  Future<int> clearGrazingSlotReferences(Set<String> slotIds) async {
+    if (slotIds.isEmpty) return 0;
+    final all = await _loadGrazings();
+    var changed = 0;
+    for (var i = 0; i < all.length; i++) {
+      final g = all[i];
+      if (g.slotId != null && slotIds.contains(g.slotId)) {
+        all[i] = Grazing(
+          id: g.id,
+          paddockId: g.paddockId,
+          at: g.at,
+          enteredAt: g.enteredAt,
+          preCover: g.preCover,
+          residual: g.residual,
+          harvestedKgDm: g.harvestedKgDm,
+          durationDays: g.durationDays,
+          slotId: null,
+          areaHa: g.areaHa,
+          groupId: g.groupId,
+        );
+        changed++;
+      }
+    }
+    if (changed > 0) await _saveGrazings(all);
+    return changed;
   }
 
   // -----------------------------
@@ -902,7 +1010,11 @@ class Storage {
     return allG.any(
       (x) {
         if (x.paddockId != paddockId) return false;
-        final grazingEnd = x.at.add(Duration(days: x.durationDays - 1));
+        final grazingEnd = DateTime(
+          x.at.year,
+          x.at.month,
+          x.at.day + (x.durationDays - 1),
+        );
         // Check if grazing overlaps with the interval (a, b)
         return x.at.isBefore(b) && grazingEnd.isAfter(a);
       },
@@ -1161,8 +1273,12 @@ class Storage {
     final sp = await SharedPreferences.getInstance();
     final raw = sp.getString(_silageCutsKey);
     if (raw == null) return [];
-    final list = jsonDecode(raw) as List;
-    return list.map((e) => SilageCut.fromMap(e)).toList();
+    try {
+      final list = jsonDecode(raw) as List;
+      return list.map((e) => SilageCut.fromMap(e)).toList();
+    } catch (_) {
+      return [];
+    }
   }
 
   Future<void> _saveSilageCuts(List<SilageCut> all) async {
@@ -1228,8 +1344,10 @@ class Storage {
 
   Future<void> migrateSilagePaddocks() async {
     final paddocks = await loadPaddocks();
+    var changed = false;
     final updated = paddocks.map((p) {
       if (p.shutForSilage && !p.isSilage) {
+        changed = true;
         return Paddock(
           id: p.id,
           name: p.name,
@@ -1243,7 +1361,7 @@ class Storage {
       return p;
     }).toList();
 
-    if (updated.length != paddocks.length) {
+    if (changed) {
       await savePaddocks(updated);
     }
   }

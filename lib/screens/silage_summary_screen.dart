@@ -16,9 +16,9 @@ class SilageSummaryScreen extends StatefulWidget {
 
 class _SilageSummaryScreenState extends State<SilageSummaryScreen> {
   late final Storage storage = Storage();
-  late final Future<List<Paddock>> _paddocksFuture;
-  late final Future<List<SilageCut>> _silageCutsFuture;
-  late final Future<Map<String, int>> _annualHarvestFuture;
+  late Future<List<Paddock>> _paddocksFuture;
+  late Future<List<SilageCut>> _silageCutsFuture;
+  late Future<Map<String, int>> _annualHarvestFuture;
   
   final Set<String> _selectedPaddockIds = {};
   bool _selectionMode = false;

@@ -198,17 +198,23 @@ class _GrazingAccuracyScreenState extends State<GrazingAccuracyScreen> {
     final lookbackStart = start.subtract(const Duration(days: 6));
     final inWindow = grazings.where((g) {
       final gStart = _day(g.at);
-      final gEnd = gStart.add(Duration(days: (g.durationDays < 1 ? 1 : g.durationDays) - 1));
+      final gEnd = DateTime(
+        gStart.year,
+        gStart.month,
+        gStart.day +
+            ((g.durationDays < 1 ? 1 : g.durationDays) - 1),
+      );
       if (gEnd.isBefore(lookbackStart) || gStart.isAfter(end)) return false;
       final p = pById[g.paddockId];
       if (p == null || !p.includeInRotation || p.shutForSilage) return false;
       return includedIds.contains(g.paddockId);
     }).toList();
 
-    final areaByDay = <DateTime, double>{};
-    final harvestByDay = <DateTime, double>{};
-    final segsAreaByDay = <DateTime, List<_StackSeg>>{};
-    final segsHarvestByDay = <DateTime, List<_StackSeg>>{};
+    // Accumulate per day, per paddock, so a paddock grazed in several slots on
+    // the same day is split across them (counted once) rather than twice.
+    final areaShares = <DateTime, Map<String, List<double>>>{};
+    final harvestShares = <DateTime, Map<String, List<double>>>{};
+    final segMeta = <DateTime, Map<String, ({String name, bool planned})>>{};
 
     for (final g in inWindow) {
       final p = pById[g.paddockId]!;
@@ -216,30 +222,56 @@ class _GrazingAccuracyScreenState extends State<GrazingAccuracyScreen> {
       forEachGrazingAllocationDay(
         g.at,
         g.durationDays,
-        areaHa: p.areaHa,
+        areaHa: g.areaHa ?? p.areaHa,
         harvestedKgDm: g.harvestedKgDm.toDouble(),
         fn: (d, area, harvest) {
           if (d.isBefore(lookbackStart) || d.isAfter(end)) return;
-          areaByDay[d] = (areaByDay[d] ?? 0) + area;
-          harvestByDay[d] = (harvestByDay[d] ?? 0) + harvest;
-          segsAreaByDay.putIfAbsent(d, () => []).add(
-                _StackSeg(
-                  paddockId: p.id,
-                  name: p.name,
-                  value: area,
-                  planned: planned,
-                ),
-              );
-          segsHarvestByDay.putIfAbsent(d, () => []).add(
-                _StackSeg(
-                  paddockId: p.id,
-                  name: p.name,
-                  value: harvest,
-                  planned: planned,
-                ),
-              );
+          ((areaShares[d] ??= {})[p.id] ??= []).add(area);
+          ((harvestShares[d] ??= {})[p.id] ??= []).add(harvest);
+          (segMeta[d] ??= {})[p.id] = (name: p.name, planned: planned);
         },
       );
+    }
+
+    final areaByDay = <DateTime, double>{};
+    final harvestByDay = <DateTime, double>{};
+    final segsAreaByDay = <DateTime, List<_StackSeg>>{};
+    final segsHarvestByDay = <DateTime, List<_StackSeg>>{};
+    double avg(List<double> xs) => xs.reduce((a, b) => a + b) / xs.length;
+
+    for (final e in areaShares.entries) {
+      var dayTotal = 0.0;
+      for (final entry in e.value.entries) {
+        final v = avg(entry.value);
+        dayTotal += v;
+        final meta = segMeta[e.key]![entry.key]!;
+        segsAreaByDay.putIfAbsent(e.key, () => []).add(
+              _StackSeg(
+                paddockId: entry.key,
+                name: meta.name,
+                value: v,
+                planned: meta.planned,
+              ),
+            );
+      }
+      areaByDay[e.key] = dayTotal;
+    }
+    for (final e in harvestShares.entries) {
+      var dayTotal = 0.0;
+      for (final entry in e.value.entries) {
+        final v = avg(entry.value);
+        dayTotal += v;
+        final meta = segMeta[e.key]![entry.key]!;
+        segsHarvestByDay.putIfAbsent(e.key, () => []).add(
+              _StackSeg(
+                paddockId: entry.key,
+                name: meta.name,
+                value: v,
+                planned: meta.planned,
+              ),
+            );
+      }
+      harvestByDay[e.key] = dayTotal;
     }
 
     // KPIs: past days in range only (through today).
@@ -247,8 +279,16 @@ class _GrazingAccuracyScreenState extends State<GrazingAccuracyScreen> {
     final kpiDays = kpiEnd.isBefore(start)
         ? 0
         : kpiEnd.difference(start).inDays + 1;
-    double areaPast = 0;
+    var areaPast = 0.0;
     var harvestPast = 0;
+    for (final e in areaByDay.entries) {
+      if (e.key.isBefore(start) || e.key.isAfter(kpiEnd)) continue;
+      areaPast += e.value;
+    }
+    for (final e in harvestByDay.entries) {
+      if (e.key.isBefore(start) || e.key.isAfter(kpiEnd)) continue;
+      harvestPast += e.value.round();
+    }
     var grazingCountPast = 0;
     final counted = <String>{};
     for (final g in inWindow) {
@@ -257,12 +297,10 @@ class _GrazingAccuracyScreenState extends State<GrazingAccuracyScreen> {
       forEachGrazingAllocationDay(
         g.at,
         g.durationDays,
-        areaHa: pById[g.paddockId]!.areaHa,
+        areaHa: g.areaHa ?? pById[g.paddockId]!.areaHa,
         harvestedKgDm: g.harvestedKgDm.toDouble(),
         fn: (d, area, harvest) {
           if (d.isBefore(start) || d.isAfter(kpiEnd)) return;
-          areaPast += area;
-          harvestPast += harvest.round();
           touched = true;
         },
       );
@@ -288,7 +326,7 @@ class _GrazingAccuracyScreenState extends State<GrazingAccuracyScreen> {
     final avgHarvestKgPerHa = areaPast > 0 ? harvestPast / areaPast : 0.0;
 
     for (var i = 0; i < days; i++) {
-      final d = start.add(Duration(days: i));
+      final d = DateTime(start.year, start.month, start.day + i);
       var windowArea = 0.0;
       for (var w = 0; w < 7; w++) {
         windowArea += areaByDay[d.subtract(Duration(days: w))] ?? 0;
@@ -339,10 +377,14 @@ class _GrazingAccuracyScreenState extends State<GrazingAccuracyScreen> {
     for (final g in grazings) {
       if (!g.at.isAfter(now)) continue;
       final d0 = _day(g.at);
-      final d1 = d0.add(Duration(days: (g.durationDays < 1 ? 1 : g.durationDays) - 1));
+      final d1 = DateTime(
+        d0.year,
+        d0.month,
+        d0.day + ((g.durationDays < 1 ? 1 : g.durationDays) - 1),
+      );
       final p = pById[g.paddockId];
       if (p == null || !p.includeInRotation || p.shutForSilage) continue;
-      plannedArea += p.areaHa;
+      plannedArea += g.areaHa ?? p.areaHa;
       plannedCount++;
       if (planStart == null || d0.isBefore(planStart)) planStart = d0;
       if (planEnd == null || d1.isAfter(planEnd)) planEnd = d1;
