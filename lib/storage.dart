@@ -1342,21 +1342,35 @@ class Storage {
     return out;
   }
 
+  /// Keeps `isSilage` and `shutForSilage` in sync. Older versions only cleared
+  /// `shutForSilage` when reopening a paddock for grazing, leaving `isSilage`
+  /// true — which made the paddock linger in the silage summary and kept it out
+  /// of the grazing planner palette. A paddock is only ever a "silage paddock"
+  /// while it is shut for silage, so any mismatch is repaired here.
   Future<void> migrateSilagePaddocks() async {
     final paddocks = await loadPaddocks();
     var changed = false;
+    Paddock fix(Paddock p, {required bool isSilage, required bool shut}) {
+      changed = true;
+      return Paddock(
+        id: p.id,
+        name: p.name,
+        areaHa: p.areaHa,
+        recordOrder: p.recordOrder,
+        includeInRotation: p.includeInRotation,
+        isSilage: isSilage,
+        shutForSilage: shut,
+      );
+    }
+
     final updated = paddocks.map((p) {
       if (p.shutForSilage && !p.isSilage) {
-        changed = true;
-        return Paddock(
-          id: p.id,
-          name: p.name,
-          areaHa: p.areaHa,
-          recordOrder: p.recordOrder,
-          includeInRotation: p.includeInRotation,
-          isSilage: true,
-          shutForSilage: p.shutForSilage,
-        );
+        // Legacy: shut but not flagged silage.
+        return fix(p, isSilage: true, shut: true);
+      }
+      if (p.isSilage && !p.shutForSilage) {
+        // Legacy: reopened for grazing but still flagged silage.
+        return fix(p, isSilage: false, shut: false);
       }
       return p;
     }).toList();
