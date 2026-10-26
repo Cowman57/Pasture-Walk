@@ -4,6 +4,7 @@ import 'package:uuid/uuid.dart';
 
 import '../models.dart';
 import '../storage.dart';
+import '../utils.dart';
 
 /// A paddock shown in the planner's bottom palette.
 class PlannerPaddock {
@@ -262,8 +263,16 @@ class _GrazingPlannerState extends State<GrazingPlanner> {
     // target, the daily total simply reflects the overage.
     final area = p.areaHa;
     final at = DateTime(day.year, day.month, day.day, 9, 0);
-    final pre = p.predictedCover > 0 ? p.predictedCover : 2000;
-    const res = 1600;
+    // Predict the cover for the day being scheduled (not for today), so a
+    // grazing dropped a week ahead carries that day's expected pre-graze cover.
+    final pre = await widget.storage.predictedCoverForPaddockOnDay(
+      p.id,
+      day,
+    );
+    // What the herd is actually being left with, inferred from the latest
+    // round of measurements, rather than a hardcoded 1600.
+    final res = await widget.storage.typicalResidualKgDmHa();
+    if (!mounted) return;
     final harvest = ((pre - res) * area).round().clamp(0, 999999999);
     await widget.storage.appendGrazing(
       Grazing(
@@ -538,8 +547,9 @@ class _GrazingPlannerState extends State<GrazingPlanner> {
 
     final pid = e.paddockId;
     final area = sample?.areaHa ?? _paddockById[pid]?.areaHa ?? 1.0;
-    final pre = sample?.preCover ?? 2000;
+    final storedPre = sample?.preCover;
     final res = sample?.residual ?? 1600;
+    final today = calendarDay(DateTime.now());
 
     for (final entry in byCol.entries) {
       final days = entry.value..sort();
@@ -558,6 +568,12 @@ class _GrazingPlannerState extends State<GrazingPlanner> {
             9,
             0,
           );
+          // Future runs carry the cover predicted for the day they start;
+          // runs in the past keep whatever cover was recorded for them.
+          final isFutureRun = !calendarDay(startDay).isBefore(today);
+          final pre = isFutureRun
+              ? await widget.storage.predictedCoverForPaddockOnDay(pid, startDay)
+              : (storedPre ?? 2000);
           final harvest = ((pre - res) * area).round().clamp(0, 999999999);
           await widget.storage.appendGrazing(
             Grazing(

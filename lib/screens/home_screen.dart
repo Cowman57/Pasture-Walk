@@ -477,7 +477,12 @@ class _HomeScreenState extends State<HomeScreen>
         .map((p) => p.id)
         .toSet();
     final farmGrowth = manualGrowth ??
-        storage.computeFarmGrowthFromLoadedData(msAll, gsAll, includedIds);
+        storage.computeFarmGrowthFromLoadedData(
+          msAll,
+          gsAll,
+          includedIds,
+          silageCuts: silageCutsAll,
+        );
 
     final msByPdk = <String, List<Measurement>>{};
     for (final m in msAll) {
@@ -530,8 +535,10 @@ class _HomeScreenState extends State<HomeScreen>
       if (!p.includeInRotation && !p.shutForSilage) {
         predicted = 0;
       } else {
-        // Use proper anchor calculation that considers measurements, grazings, and silage cuts
-        final anchor = Storage.latestAnchorFromLists(
+        // Anchor on farming days (05:00 rollover) so a break planned for today
+        // cannot override a cover measured later this morning, and growth is
+        // added once per day rather than drifting with timestamps.
+        final anchor = Storage.predictionAnchorFromLists(
           msAll,
           gsAll,
           silageCutsAll,
@@ -539,7 +546,9 @@ class _HomeScreenState extends State<HomeScreen>
           now,
         );
         final baseCover = anchor?.coverKgDmHa ?? 2500;
-        final days = anchor == null ? 0 : now.difference(anchor.at).inDays;
+        final days = anchor == null
+            ? 0
+            : Storage.farmingDaysBetween(anchor.at, now);
         predicted = clampCover(baseCover + (days * farmGrowth).round());
       }
 
@@ -2059,14 +2068,20 @@ color: p.shutForSilage
       color: Colors.orange.withValues(alpha: 0.95),
     );
   }
-int _calculateAveragePredicted(List<_RowData> rows) {
-    final predicted = rows
-        .map((r) => r.predicted)
-        .where((v) => v > 0)
-        .toList();
-    return predicted.isEmpty
-        ? 0
-        : (predicted.reduce((a, b) => a + b) / predicted.length).round();
+/// Area-weighted mean predicted cover: a 3.5 ha paddock must count for more
+  /// than a 1.5 ha one, otherwise this is an average of paddock sizes rather
+  /// than of the farm.
+  int _calculateAveragePredicted(List<_RowData> rows) {
+    var area = 0.0;
+    var weighted = 0.0;
+    for (final r in rows) {
+      if (r.predicted <= 0) continue;
+      final a = r.paddock.areaHa;
+      if (a <= 0) continue;
+      area += a;
+      weighted += r.predicted * a;
+    }
+    return area <= 0 ? 0 : (weighted / area).round();
   }
 
   (int?, DateTime?) _calculateMeasuredAverage(List<_RowData> rows) {
@@ -2087,17 +2102,19 @@ int _calculateAveragePredicted(List<_RowData> rows) {
     
     if (lastMeasureDay == null) return (null, null);
     
-    final measuredCovers = <int>[];
+    // Area-weighted, same reasoning as [_calculateAveragePredicted].
+    var area = 0.0;
+    var weighted = 0.0;
     for (final r in rows) {
       if (r.lastCover == null || r.lastAt == null) continue;
-      if (calendarDay(r.lastAt!) == lastMeasureDay) {
-        measuredCovers.add(r.lastCover!);
-      }
+      if (calendarDay(r.lastAt!) != lastMeasureDay) continue;
+      final a = r.paddock.areaHa;
+      if (a <= 0) continue;
+      area += a;
+      weighted += r.lastCover! * a;
     }
     
-    return measuredCovers.isEmpty
-        ? (null, null)
-        : ((measuredCovers.reduce((a, b) => a + b) / measuredCovers.length).round(), lastMeasureAt);
+    return area <= 0 ? (null, null) : ((weighted / area).round(), lastMeasureAt);
   }
 
 
@@ -2126,11 +2143,19 @@ int _calculateAveragePredicted(List<_RowData> rows) {
     // Calculate area excluded for silage
     final silageExcludedArea = silageRows.fold(0.0, (sum, r) => sum + r.paddock.areaHa);
     
-    final wedgePaddocks = inRoundRows.where((r) => r.predicted > 0).map((r) {
-      final m = RegExp(r'\d+').firstMatch(r.paddock.name);
-      final label = m?.group(0) ?? '';
-      return _WedgePaddock(label: label, cover: r.predicted);
-    }).toList();
+    // A wedge is paddocks ordered by cover, widest feed first, so the area under
+  // the curve is real feed rather than an arbitrary skyline.
+  final wedgePaddocks = inRoundRows
+      .where((r) => r.predicted > 0)
+      .map(
+        (r) => _WedgePaddock(
+          label: RegExp(r'\d+').firstMatch(r.paddock.name)?.group(0) ?? '',
+          area: r.paddock.areaHa,
+          cover: r.predicted,
+        ),
+      )
+      .toList()
+    ..sort((a, b) => b.cover.compareTo(a.cover));
 
     final bottomInset = MediaQuery.paddingOf(context).bottom;
     return ListView(
@@ -2905,6 +2930,10 @@ int _calculateAveragePredicted(List<_RowData> rows) {
     );
   }
 
+  /// Which reading the cover-trend card is showing: the projected mass
+  /// balance, or the change actually measured between farm walks.
+  bool _trendShowsMeasured = false;
+
   Widget _summaryCards({
     required int? allMeasuredAvg,
     required DateTime? allMeasuredAt,
@@ -2923,7 +2952,8 @@ int _calculateAveragePredicted(List<_RowData> rows) {
         storage.loadAreaGrazedPerDayHa(),
         storage.loadCoverTrendTimescale(),
         storage.loadPaddocks(),
-        storage.loadAllGrazings(),
+        storage.prePostTargets(),
+        storage.measuredCoverTrend(),
       ]),
       builder: (context, snap) {
         final data = snap.data;
@@ -2939,50 +2969,59 @@ int _calculateAveragePredicted(List<_RowData> rows) {
         final allPaddocks = (data != null && data.length > 3)
             ? (data[3] as List<Paddock>)
             : <Paddock>[];
-        final allGrazings = (data != null && data.length > 4)
-            ? (data[4] as List<Grazing>)
-            : <Grazing>[];
+        final targets = (data != null && data.length > 4)
+            ? (data[4] as PrePostTargets)
+            : (
+                pre: Storage.defaultPreGrazingCover,
+                post: 1600,
+                overridden: false,
+              );
+        final preTarget = targets.pre;
+        final postTarget = targets.post;
 
-        final includedIds = allPaddocks
-            .where((p) => p.includeInRotation && !p.isSilage && !p.shutForSilage)
-            .map((p) => p.id)
-            .toSet();
+        final measured = (data != null && data.length > 5)
+            ? (data[5] as ({
+                double perDay,
+                double perWeek,
+                double fromCover,
+                double toCover,
+                DateTime from,
+                DateTime to,
+                int walks,
+              })?)
+            : null;
 
-        final includedArea = allPaddocks
+        // The grazing platform: what the round actually walks over. Shut-for-
+        // silage paddocks are out of it, so shutting paddocks shortens the round.
+        final platformArea = allPaddocks
             .where((p) => p.includeInRotation && !p.isSilage && !p.shutForSilage)
             .fold<double>(0.0, (sum, p) => sum + p.areaHa);
 
-        final roundLengthDays = (areaPerDay > 0 && includedArea > 0)
-            ? (includedArea / areaPerDay)
+        // All pasture on the farm, including paddocks shut for silage — their
+        // grass is still feed in the paddock, so it belongs in APC/Expected.
+        final pastureArea = allPaddocks
+            .where((p) => p.includeInRotation || p.isSilage || p.shutForSilage)
+            .fold<double>(0.0, (sum, p) => sum + p.areaHa);
+
+        final roundLengthDays = (areaPerDay > 0 && platformArea > 0)
+            ? (platformArea / areaPerDay)
             : null;
 
-        // Cover trend: avg actual pre/post from last 7 days of past grazings only.
-        final now = DateTime.now();
-        final since = now.subtract(const Duration(days: 7));
-        final recentPast = allGrazings
-            .where(
-              (g) =>
-                  includedIds.contains(g.paddockId) &&
-                  !g.at.isAfter(now) &&
-                  !g.at.isBefore(since),
-            )
-            .toList();
-        double? requiredGrowth;
-        if (roundLengthDays != null &&
-            roundLengthDays > 0 &&
-            recentPast.isNotEmpty) {
-          final avgPre =
-              recentPast.map((g) => g.preCover).reduce((a, b) => a + b) /
-              recentPast.length;
-          final avgPost =
-              recentPast.map((g) => g.residual).reduce((a, b) => a + b) /
-              recentPast.length;
-          requiredGrowth = (avgPre - avgPost) / roundLengthDays;
-        }
+        // Cover trend is a mass balance, not an estimate:
+        //   trend  = growth - demand
+        //   demand = (area eaten per day / pasture area) * (pre - post)
+        // The removal happens on the platform but is spread over ALL pasture,
+        // because the cover being tracked includes the shut paddocks. Dividing
+        // by the platform instead would inflate demand by pasture/platform
+        // every time paddocks are shut for silage.
+        final demandPerDay =
+            (areaPerDay > 0 && pastureArea > 0 && preTarget > postTarget)
+            ? (areaPerDay / pastureArea) * (preTarget - postTarget)
+            : null;
 
-        final deltaPerDay = requiredGrowth == null
+        final deltaPerDay = demandPerDay == null
             ? null
-            : (growth - requiredGrowth);
+            : (growth - demandPerDay);
 
         final factor = timescale == 'week'
             ? 7.0
@@ -3004,6 +3043,29 @@ int _calculateAveragePredicted(List<_RowData> rows) {
         final roundText = roundLengthDays == null
             ? '—'
             : roundLengthDays.toStringAsFixed(1);
+
+        // The measured trend follows the same day/week/month scale so the two
+        // tabs are directly comparable.
+        final measuredScaled = measured == null
+            ? null
+            : (timescale == 'week'
+                  ? measured.perWeek
+                  : (timescale == 'month'
+                        ? measured.perDay * 30
+                        : measured.perDay));
+
+        final trendShown = _trendShowsMeasured
+            ? (measuredScaled == null
+                  ? '—'
+                  : '${measuredScaled >= 0 ? '+' : ''}'
+                        '${measuredScaled.toStringAsFixed(0)}')
+            : deltaText;
+
+        final trendSubText = _trendShowsMeasured
+            ? (measured == null
+                  ? 'no farm walks to compare'
+                  : 'measured over ${measured.walks} walks')
+            : timescaleUnit;
 
         return Column(
           children: [
@@ -3122,8 +3184,18 @@ int _calculateAveragePredicted(List<_RowData> rows) {
                 ),
                 const SizedBox(width: 10),
                 Expanded(
-                  child: InkWell(
-                    onTap: _editTrendTimescale,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    // Swipe left for measured, right for the projection — the
+                    // same gesture the APC box uses.
+                    onHorizontalDragEnd: (details) {
+                      final v = details.primaryVelocity ?? 0;
+                      if (v <= -200) {
+                        setState(() => _trendShowsMeasured = true);
+                      } else if (v >= 200) {
+                        setState(() => _trendShowsMeasured = false);
+                      }
+                    },
                     child: Card(
                       elevation: 0,
                       color: Colors.black.withValues(alpha: 0.04),
@@ -3135,29 +3207,51 @@ int _calculateAveragePredicted(List<_RowData> rows) {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(
-                              'Cover trend',
-                              style: const TextStyle(
-                                fontSize: 12,
-                                color: Colors.black54,
-                                fontWeight: FontWeight.w700,
+                            GestureDetector(
+                              onTap: () => setState(
+                                () =>
+                                    _trendShowsMeasured = !_trendShowsMeasured,
+                              ),
+                              child: Text(
+                                _trendShowsMeasured ? 'Measured' : 'Expected',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.black54,
+                                  fontWeight: FontWeight.w700,
+                                ),
                               ),
                             ),
                             const SizedBox(height: 6),
-                            Text(
-                              deltaText,
-                              style: const TextStyle(
-                                fontSize: 22,
-                                fontWeight: FontWeight.w900,
+                            GestureDetector(
+                              onTap: _editTrendTimescale,
+                              child: AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 150),
+                                child: Text(
+                                  trendShown,
+                                  key: ValueKey<bool>(_trendShowsMeasured),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.w900,
+                                  ),
+                                ),
                               ),
                             ),
                             const SizedBox(height: 2),
-                            Text(
-                              timescaleUnit,
-                              style: const TextStyle(
-                                fontSize: 11,
-                                color: Colors.black54,
-                                fontWeight: FontWeight.w700,
+                            GestureDetector(
+                              onTap: _editTrendTimescale,
+                              child: Text(
+                                trendSubText,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.black54,
+                                  fontWeight: FontWeight.w700,
+                                ),
                               ),
                             ),
                           ],
@@ -4051,8 +4145,13 @@ Widget _grazingsTab(List<_RowData> rows) {
 
 class _WedgePaddock {
   final String label;
+  final double area;
   final int cover;
-  const _WedgePaddock({required this.label, required this.cover});
+  const _WedgePaddock({
+    required this.label,
+    required this.area,
+    required this.cover,
+  });
 }
 
 class _FeedWedge extends StatelessWidget {
@@ -4066,53 +4165,19 @@ class _FeedWedge extends StatelessWidget {
     required this.onChanged,
   });
 
-  Future<({int? avgPre, int? avgPost})> _autoPrePost() async {
-    final paddocksAll = await storage.loadPaddocks();
-    final includedIds = paddocksAll
-        .where((p) => p.includeInRotation && !p.isSilage && !p.shutForSilage)
-        .map((p) => p.id)
-        .toSet();
-
-    final now = DateTime.now();
-    final allGrazings = await storage.loadAllGrazings();
-    final scheduled = allGrazings.where(
-      (g) => includedIds.contains(g.paddockId) && g.at.isAfter(now),
-    ).toList();
-
-    if (scheduled.isNotEmpty) {
-      final avgPre = (scheduled
-              .map((g) => g.preCover)
-              .reduce((a, b) => a + b) /
-          scheduled.length).round();
-      final avgPost = (scheduled
-              .map((g) => g.residual)
-              .reduce((a, b) => a + b) /
-          scheduled.length).round();
-      return (avgPre: avgPre, avgPost: avgPost);
-    }
-
-    final avg = await storage.avgGrazingPrePostLastDays(
-      days: 7,
-      includedPaddockIds: includedIds,
-    );
-    return (avgPre: avg.avgPre, avgPost: avg.avgPost);
-  }
-
   Future<void> _editTargets(BuildContext context) async {
-    final auto = await _autoPrePost();
-    final preOverride = await storage.loadFeedWedgePreGrazingOverride();
-    final postOverride = await storage.loadFeedWedgePostGrazingResidualOverride();
+    final targets = await storage.prePostTargets();
+    final autoPre =
+        await storage.recentPreGrazingCover() ??
+        Storage.defaultPreGrazingCover;
+    final autoPost = await storage.typicalResidualKgDmHa();
     if (!context.mounted) return;
 
-    final preCtrl = TextEditingController(
-      text: (preOverride ?? auto.avgPre)?.toString() ?? '',
-    );
-    final postCtrl = TextEditingController(
-      text: (postOverride ?? auto.avgPost)?.toString() ?? '',
-    );
-    final autoLabel = (auto.avgPre != null && auto.avgPost != null)
-        ? 'Auto: ${auto.avgPre} → ${auto.avgPost}'
-        : 'Auto: no grazings available';
+    final preCtrl = TextEditingController(text: targets.pre.toString());
+    final postCtrl = TextEditingController(text: targets.post.toString());
+    final autoLabel =
+        'Auto: $autoPre → $autoPost'
+        '  (predicted pre-graze cover, residual inferred from the latest walk)';
 
     final result = await showDialog<String>(
       context: context,
@@ -4196,35 +4261,67 @@ class _FeedWedge extends StatelessWidget {
     await onChanged();
   }
 
+  /// Wide enough that every bar can carry its paddock number on the x-axis;
+  /// the chart scrolls sideways when there are more paddocks than fit.
+  double _chartWidth(BuildContext context) {
+    const minBarW = 32.0;
+    final available = MediaQuery.of(context).size.width - 48;
+    final wanted = paddocks.length * minBarW;
+    return wanted > available ? wanted : available;
+  }
+
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<List<dynamic>>(
       future: Future.wait([
-        storage.loadFeedWedgePreGrazingOverride(),
-        storage.loadFeedWedgePostGrazingResidualOverride(),
-        _autoPrePost(),
+        storage.prePostTargets(),
+        storage.loadAreaGrazedPerDayHa(),
       ]),
       builder: (context, snap) {
-        final preOverride = (snap.data != null && snap.data!.isNotEmpty)
-            ? snap.data![0] as int?
-            : null;
-        final postOverride = (snap.data != null && snap.data!.length > 1)
-            ? snap.data![1] as int?
-            : null;
-        final auto = (snap.data != null && snap.data!.length > 2)
-            ? snap.data![2] as ({int? avgPre, int? avgPost})
-            : (avgPre: null, avgPost: null);
+        final targets = (snap.data != null && snap.data!.isNotEmpty)
+            ? snap.data![0] as PrePostTargets
+            : (
+                pre: Storage.defaultPreGrazingCover,
+                post: 1600,
+                overridden: false,
+              );
+        final areaPerDay = (snap.data != null && snap.data!.length > 1)
+            ? snap.data![1] as double
+            : 0.0;
 
-        final pre = preOverride ?? auto.avgPre ?? 2800;
-        final post = postOverride ?? auto.avgPost ?? 1500;
-        final isAuto = preOverride == null && postOverride == null;
-        final buttonLabel = isAuto
-            ? 'Auto: $pre → $post'
-            : 'Override: $pre → $post';
+        final pre = targets.pre;
+        final post = targets.post;
+        final buttonLabel = targets.overridden
+            ? 'Override: $pre → $post'
+            : 'Auto: $pre → $post';
 
-        final screenW = MediaQuery.of(context).size.width;
-        final plotW = (paddocks.length * 26).toDouble();
-        final chartW = plotW < (screenW - 24) ? (screenW - 24) : plotW;
+        // Surplus is the feed sitting above the target line, integrated over
+        // each paddock's area, and daily demand turns it into days of feed.
+        final totalArea = paddocks.fold<double>(0, (s, p) => s + p.area);
+        var cum = 0.0;
+        var surplus = 0.0;
+        for (final p in paddocks) {
+          final f0 = totalArea <= 0 ? 0.0 : cum / totalArea;
+          final f1 = totalArea <= 0 ? 0.0 : (cum + p.area) / totalArea;
+          cum += p.area;
+          final target = pre + (post - pre) * ((f0 + f1) / 2);
+          if (p.cover > target) surplus += (p.cover - target) * p.area;
+        }
+        final demandPerDay = areaPerDay * (pre - post);
+        final days = (demandPerDay > 0 ? surplus / demandPerDay : null);
+
+        final subtitle = StringBuffer()
+          ..write('${totalArea.toStringAsFixed(1)} ha · ')
+          ..write('${paddocks.length} paddocks');
+        if (days == null) {
+          subtitle.write(' · surplus —');
+        } else if (days < 0.3) {
+          subtitle.write(' · balanced');
+        } else {
+          subtitle
+            ..write(' · surplus ${(surplus / 1000).toStringAsFixed(1)} tDM')
+            ..write(' = ${days.toStringAsFixed(1)} days');
+        }
 
         return Card(
           elevation: 0,
@@ -4236,13 +4333,27 @@ class _FeedWedge extends StatelessWidget {
               children: [
                 Row(
                   children: [
-                    const Expanded(
-                      child: Text(
-                        'Feed wedge',
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w800,
-                        ),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Feed wedge',
+                            style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            subtitle.toString(),
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: Colors.black54,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                     TextButton(
@@ -4257,7 +4368,8 @@ class _FeedWedge extends StatelessWidget {
                   child: SingleChildScrollView(
                     scrollDirection: Axis.horizontal,
                     child: SizedBox(
-                      width: chartW,
+                      width: _chartWidth(context),
+                      height: 320,
                       child: CustomPaint(
                         painter: _FeedWedgePainter(
                           paddocks: paddocks,
@@ -4288,12 +4400,18 @@ class _FeedWedgePainter extends CustomPainter {
     required this.postResidualTarget,
   });
 
+  static const _labelStyle = TextStyle(
+    fontSize: 10,
+    color: Color(0x99000000),
+    fontWeight: FontWeight.w700,
+  );
+
   @override
   void paint(Canvas canvas, Size size) {
-    final leftPad = 44.0;
-    final rightPad = 10.0;
-    final topPad = 10.0;
-    final bottomPad = 46.0;
+    const leftPad = 44.0;
+    const rightPad = 10.0;
+    const topPad = 10.0;
+    const bottomPad = 34.0;
 
     final plot = Rect.fromLTWH(
       leftPad,
@@ -4302,6 +4420,7 @@ class _FeedWedgePainter extends CustomPainter {
       size.height - topPad - bottomPad,
     );
 
+    final totalArea = paddocks.fold<double>(0, (s, p) => s + p.area);
     final maxCover = paddocks.isEmpty
         ? 0
         : paddocks.map((p) => p.cover).reduce((a, b) => a > b ? a : b);
@@ -4310,7 +4429,7 @@ class _FeedWedgePainter extends CustomPainter {
       preTarget,
       postResidualTarget,
     ].reduce((a, b) => a > b ? a : b);
-    final yMax = ((yMax0 + 199) ~/ 200) * 200;
+    final yMax = ((yMax0 + 499) ~/ 500) * 500;
 
     final gridPaint = Paint()
       ..style = PaintingStyle.stroke
@@ -4325,76 +4444,87 @@ class _FeedWedgePainter extends CustomPainter {
     for (int y = 0; y <= yMax; y += 500) {
       final yy = _y(plot, y.toDouble(), yMax.toDouble());
       canvas.drawLine(Offset(plot.left, yy), Offset(plot.right, yy), gridPaint);
-      _drawText(
-        canvas,
-        y.toString(),
-        Offset(6, yy - 7),
-        const TextStyle(
-          fontSize: 10,
-          color: Color(0x99000000),
-          fontWeight: FontWeight.w700,
-        ),
-      );
+      _drawText(canvas, y.toString(), Offset(6, yy - 7), _labelStyle);
     }
 
     canvas.drawRect(plot, axisPaint);
 
-    if (paddocks.isEmpty) {
-      return;
-    }
+    if (paddocks.isEmpty || totalArea <= 0 || plot.width <= 0) return;
 
-    final n = paddocks.length;
-    final barW = plot.width / n;
+    double xAt(double ha) => plot.left + (ha / totalArea) * plot.width;
+    double targetAt(double ha) =>
+        preTarget + (postResidualTarget - preTarget) * (ha / totalArea);
+
     final barPaint = Paint()..color = const Color(0xFF6DAA41);
+    final surplusPaint = Paint()..color = const Color(0xFFB4DD86);
 
-    for (int i = 0; i < n; i++) {
-      final p = paddocks[i];
-      final x0 = plot.left + i * barW;
-      final x1 = x0 + barW;
-      final y0 = _y(plot, p.cover.toDouble(), yMax.toDouble());
+    var cum = 0.0;
+    for (final p in paddocks) {
+      final x0 = xAt(cum);
+      final x1 = xAt(cum + p.area);
+      final midTarget = (targetAt(cum) + targetAt(cum + p.area)) / 2;
+      cum += p.area;
 
-      final rect = Rect.fromLTRB(
-        x0 + barW * 0.18,
-        y0,
-        x1 - barW * 0.18,
-        plot.bottom,
+      final top = _y(plot, p.cover.toDouble(), yMax.toDouble());
+      canvas.drawRect(
+        Rect.fromLTRB(x0 + 0.4, top, x1 - 0.4, plot.bottom),
+        barPaint,
       );
-      canvas.drawRect(rect, barPaint);
-
-      final label = p.label;
-      if (label.isNotEmpty) {
-        final tp = TextPainter(
-          text: TextSpan(
-            text: label,
-            style: const TextStyle(
-              fontSize: 10,
-              color: Color(0xCC000000),
-              fontWeight: FontWeight.w700,
-            ),
+      if (p.cover > midTarget) {
+        canvas.drawRect(
+          Rect.fromLTRB(
+            x0 + 0.4,
+            top,
+            x1 - 0.4,
+            _y(plot, midTarget, yMax.toDouble()),
           ),
-          textDirection: TextDirection.ltr,
-          maxLines: 1,
-          textAlign: TextAlign.center,
-          ellipsis: '…',
-        )..layout(maxWidth: barW);
-        tp.paint(canvas, Offset(x0 + (barW - tp.width) / 2, plot.bottom + 6));
+          surplusPaint,
+        );
+      }
+
+      if (p.label.isNotEmpty) {
+        _drawCentred(canvas, p.label, x0, x1, plot.bottom + 5);
       }
     }
 
+    // Target line: pre-graze cover on the left, residual on the right. Feed
+    // above this line (shaded) is what is ready to be eaten ahead of schedule.
     final linePaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2
       ..color = const Color(0xFF2F66E3);
+    canvas.drawLine(
+      Offset(plot.left, _y(plot, preTarget.toDouble(), yMax.toDouble())),
+      Offset(
+        plot.right,
+        _y(plot, postResidualTarget.toDouble(), yMax.toDouble()),
+      ),
+      linePaint,
+    );
 
-    final xStart = plot.left + barW * 0.5;
-    final xEnd = plot.left + barW * (n - 0.5);
-    final yStart = _y(plot, preTarget.toDouble(), yMax.toDouble());
-    final yEnd = _y(plot, postResidualTarget.toDouble(), yMax.toDouble());
-    canvas.drawLine(Offset(xStart, yStart), Offset(xEnd, yEnd), linePaint);
+  }
+
+  /// Draws [text] centred between [x0] and [x1] at [y], shrinking to fit the
+  /// bar it belongs to.
+  void _drawCentred(
+    Canvas canvas,
+    String text,
+    double x0,
+    double x1,
+    double y,
+  ) {
+    final w = (x1 - x0).clamp(1.0, double.infinity);
+    final tp = TextPainter(
+      text: TextSpan(text: text, style: _labelStyle),
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+      ellipsis: '…',
+    )..layout(maxWidth: w);
+    tp.paint(canvas, Offset(x0 + (w - tp.width) / 2, y));
   }
 
   double _y(Rect plot, double value, double yMax) {
-    final v = value.clamp(0, yMax);
+    final v = value.clamp(0.0, yMax);
     final frac = yMax <= 0 ? 0.0 : (v / yMax);
     return plot.bottom - frac * plot.height;
   }

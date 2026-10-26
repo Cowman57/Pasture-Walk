@@ -293,9 +293,8 @@ class _RecordingOrderScreenState extends State<RecordingOrderScreen> {
   Widget _listView() {
     return ReorderableListView.builder(
       itemCount: paddocks.length,
-      onReorder: (oldIndex, newIndex) async {
+      onReorderItem: (oldIndex, newIndex) async {
         setState(() {
-          if (newIndex > oldIndex) newIndex -= 1;
           final item = paddocks.removeAt(oldIndex);
           paddocks.insert(newIndex, item);
         });

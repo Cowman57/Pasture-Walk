@@ -290,6 +290,7 @@ class _RoundScreenState extends State<RoundScreen>
           allMeasurements,
           allGrazings,
           includedIds,
+          silageCuts: allSilageCuts,
         );
 
     final now = DateTime.now();

@@ -134,16 +134,12 @@ class _GrazingSchedulePreviewScreenState
 
     final drafts = _blocks!.where((b) => b.isDraft).toList();
     final res = clampCover(widget.residualKgDmHa);
-    final farmGrowth = await storage.effectiveFarmGrowthKgDmPerHaPerDay();
     final enteredAt = DateTime.now();
 
     for (final b in drafts) {
       final when = _day(b.startDay);
-      final anchor = await storage.latestAnchorForPaddockAsOf(b.paddockId, when);
-      final baseCover = anchor?.coverKgDmHa ?? 2500;
-      final baseAt = anchor?.at;
-      final growDays = baseAt == null ? 0 : when.difference(baseAt).inDays;
-      final pre = clampCover(baseCover + (growDays * farmGrowth).round());
+      // Cover expected on the scheduled day, not on the day of scheduling.
+      final pre = await storage.predictedCoverForPaddockOnDay(b.paddockId, when);
       final harvested =
           ((pre - res) * b.areaHa).round().clamp(0, 999999999);
 

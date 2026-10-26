@@ -51,6 +51,9 @@ function gc  { param([Parameter(Mandatory)][string]$Message) proj; git commit -m
 function gp  { proj; git push }
 function gu  { proj; git pull --ff-only }
 
+# Force-push rewritten history (branches + tags). Only use after a history rewrite.
+function gp-force { proj; git push --force origin master; git push --force --tags origin }
+
 # ---------------------------------------------------------------- search
 function ffind {
     param([Parameter(Mandatory)][string]$Name)

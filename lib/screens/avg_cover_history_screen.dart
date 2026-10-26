@@ -143,12 +143,19 @@ class _AvgCoverHistoryScreenState extends State<AvgCoverHistoryScreen> {
     final batch = await Future.wait([
       storage.loadAllMeasurements(),
       storage.loadAllGrazings(),
+      storage.loadAllSilageCuts(),
     ]);
     final msAll = batch[0] as List<Measurement>;
     final gsAll = batch[1] as List<Grazing>;
+    final cutsAll = batch[2] as List<SilageCut>;
     final includedIds = included.map((p) => p.id).toSet();
     final farmGrowth = manualGrowth ??
-        storage.computeFarmGrowthFromLoadedData(msAll, gsAll, includedIds);
+        storage.computeFarmGrowthFromLoadedData(
+          msAll,
+          gsAll,
+          includedIds,
+          silageCuts: cutsAll,
+        );
 
     final msByPdk = <String, List<Measurement>>{};
     for (final m in msAll) {

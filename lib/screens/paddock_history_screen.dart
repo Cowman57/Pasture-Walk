@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:uuid/uuid.dart';
 
 import '../models.dart';
 import '../storage.dart';
@@ -29,7 +28,6 @@ class PaddockHistoryScreen extends StatefulWidget {
 class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
     with SingleTickerProviderStateMixin {
   final storage = Storage();
-  final uuid = const Uuid();
   late final TabController _tabs;
 
   static const int _minCoverBar = 1200;
@@ -498,88 +496,6 @@ class _PaddockHistoryScreenState extends State<PaddockHistoryScreen>
     if (!mounted) return;
     _bumpRefresh();
   }
-
-  Future<void> _addSilageCut() async {
-    final preCtrl = TextEditingController();
-    final resCtrl = TextEditingController();
-    var at = DateTime.now();
-
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setLocal) => AlertDialog(
-          title: const Text('Record silage cut'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text('When: ${_fmtDateLong(at)}'),
-                TextButton(
-                  onPressed: () async {
-                    final next = await _pickDateTime(at);
-                    if (next != null) setLocal(() => at = next);
-                  },
-                  child: const Text('Change date & time'),
-                ),
-                TextField(
-                  controller: preCtrl,
-                  decoration: const InputDecoration(
-                    labelText: 'Pre-cut cover (kgDM/ha)',
-                  ),
-                  keyboardType: TextInputType.number,
-                ),
-                TextField(
-                  controller: resCtrl,
-                  decoration: const InputDecoration(
-                    labelText: 'Residual after cut (kgDM/ha)',
-                  ),
-                  keyboardType: TextInputType.number,
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Save'),
-            ),
-          ],
-        ),
-      ),
-    );
-    if (ok != true || !mounted) return;
-
-    final pre = int.tryParse(preCtrl.text.trim());
-    final res = int.tryParse(resCtrl.text.trim());
-    if (pre == null || res == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter valid numbers.')),
-      );
-      return;
-    }
-    final preC = clampCover(pre);
-    final resC = clampCover(res);
-    final area = widget.paddock.areaHa;
-    final harvested = area <= 0
-        ? 0
-        : ((preC - resC) * area).round().clamp(0, 999999999);
-
-    await storage.appendSilageCut(SilageCut(
-      id: uuid.v4(),
-      paddockId: widget.paddock.id,
-      at: at,
-      preCover: preC,
-      residual: resC,
-      harvestedKgDm: harvested,
-    ));
-    if (!mounted) return;
-    _bumpRefresh();
-}
 
   Future<void> _deleteSilageCut(SilageCut cut) async {
     final ok = await _confirmDelete(

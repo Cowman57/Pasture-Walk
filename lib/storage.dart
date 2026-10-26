@@ -3,6 +3,11 @@ import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'models.dart';
+import 'utils.dart';
+
+/// Effective pre-graze and post-graze (residual) targets, shared by every
+/// figure that budgets feed — the feed wedge and the cover trend.
+typedef PrePostTargets = ({int pre, int post, bool overridden});
 
 class Storage {
   // -----------------------------
@@ -601,6 +606,32 @@ class Storage {
     return best;
   }
 
+  // -----------------------------
+  // FARMING DAY (05:00 ROLLOVER)
+  // -----------------------------
+
+  /// The hour at which the farm clicks over to a new day. A grazing planned for
+  /// a day anchors the paddock at that day's residual, and one day of growth is
+  /// added, all at this one point — so predictions change once per day instead
+  /// of whenever a timestamp happens to land after a measurement.
+  static const int dayRolloverHour = 5;
+
+  /// The farming day [t] belongs to (times before [dayRolloverHour] belong to
+  /// the previous day).
+  static DateTime farmingDay(DateTime t) {
+    final shifted = t.subtract(const Duration(hours: dayRolloverHour));
+    return DateTime(shifted.year, shifted.month, shifted.day);
+  }
+
+  /// Whole farming days between [from] and [to] (UTC diff, so DST-safe).
+  static int farmingDaysBetween(DateTime from, DateTime to) {
+    final a = farmingDay(from);
+    final b = farmingDay(to);
+    return DateTime.utc(b.year, b.month, b.day)
+        .difference(DateTime.utc(a.year, a.month, a.day))
+        .inDays;
+  }
+
   /// Same rules as [latestAnchorForPaddockAsOf] using pre-loaded lists (batch use).
   static Anchor? latestAnchorFromLists(
     List<Measurement> allMeasurements,
@@ -662,6 +693,57 @@ class Storage {
     return candidates.first;
   }
 
+  /// Anchor used for predicting a paddock's cover at [asOf].
+  ///
+  /// Differs from [latestAnchorFromLists] in the two ways that matter once
+  /// grazings are planned ahead of time:
+  ///  * events are ordered by *farming day* ([farmingDay]), not clock time, so a
+  ///    break planned for today cannot override a cover measured this morning;
+  ///  * within one farming day a real measurement outranks a planned residual.
+  static Anchor? predictionAnchorFromLists(
+    List<Measurement> allMeasurements,
+    List<Grazing> allGrazings,
+    List<SilageCut> allSilageCuts,
+    String paddockId,
+    DateTime asOf,
+  ) {
+    final today = farmingDay(asOf);
+    Anchor? best;
+    DateTime? bestAt;
+    var bestMeasured = false;
+
+    void consider(DateTime at, int cover, bool measured) {
+      final day = farmingDay(at);
+      if (day.isAfter(today)) return; // not happened yet
+      if (bestAt == null) {
+        best = Anchor(at, cover);
+        bestAt = at;
+        bestMeasured = measured;
+        return;
+      }
+      final cmp = day.compareTo(farmingDay(bestAt!));
+      if (cmp < 0) return;
+      final takesIt = cmp > 0 ||
+          (measured && !bestMeasured) ||
+          (measured == bestMeasured && at.isAfter(bestAt!));
+      if (!takesIt) return;
+      best = Anchor(at, cover);
+      bestAt = at;
+      bestMeasured = measured;
+    }
+
+    for (final m in allMeasurements) {
+      if (m.paddockId == paddockId) consider(m.at, m.cover, true);
+    }
+    for (final g in allGrazings) {
+      if (g.paddockId == paddockId) consider(g.at, g.residual, false);
+    }
+    for (final s in allSilageCuts) {
+      if (s.paddockId == paddockId) consider(s.at, s.residual, false);
+    }
+    return best;
+  }
+
   Future<List<Measurement>> measurementsForPaddock(String paddockId) async {
     final all = await _loadMeasurements();
     return all.where((m) => m.paddockId == paddockId).toList()
@@ -686,6 +768,43 @@ class Storage {
     final allG = await _loadGrazings();
     final allS = await _loadSilageCuts();
     return latestAnchorFromLists(allM, allG, allS, paddockId, asOf);
+  }
+
+  /// Predicted cover for [paddockId] **on [day]**: the latest anchor at or
+  /// before that calendar day, grown at the farm growth rate up to it.
+  ///
+  /// Scheduling a grazing uses this so the break carries the cover the paddock
+  /// is expected to have on the day it is scheduled for — not the cover it has
+  /// on the day the grazing was entered.
+  Future<int> predictedCoverForPaddockOnDay(
+    String paddockId,
+    DateTime day,
+  ) async {
+    final allM = await _loadMeasurements();
+    final allG = await _loadGrazings();
+    final allS = await _loadSilageCuts();
+    final anchor = predictionAnchorFromLists(
+      allM,
+      allG,
+      allS,
+      paddockId,
+      day,
+    );
+    final growth = await effectiveFarmGrowthKgDmPerHaPerDay();
+    return predictCoverFromAnchor(anchor, day, growth);
+  }
+
+  /// Pure (no I/O) cover prediction: [anchor] grown per day up to [onDay].
+  static int predictCoverFromAnchor(
+    Anchor? anchor,
+    DateTime onDay,
+    double growthKgDmPerHaPerDay,
+  ) {
+    if (anchor == null) return clampCover(2500);
+    final days = farmingDaysBetween(anchor.at, onDay);
+    final grown =
+        anchor.coverKgDmHa + (days * growthKgDmPerHaPerDay).round();
+    return clampCover(grown);
   }
 
   /// Overwrites measurement for today if present
@@ -939,11 +1058,282 @@ class Storage {
   // FARM GROWTH (MEASURED)
   // Excludes paddocks not included in rotation.
   // -----------------------------
+
+  /// Growth is only estimated over intervals of at least this length. A 1-day
+  /// interval turns +/-50 kgDM/ha of measurement noise into +/-50 kgDM/ha/day.
+  static const double _minGrowthIntervalDays = 3;
+
+  /// Physically implausible daily growth — almost always a double-counted
+  /// removal (a paddock split over two breaks) or a bad reading.
+  static const double _maxGrowthRatePerDay = 200;
+
+  /// Best estimate of the residual actually left by [grazing], from the first
+  /// measurement taken after it and the farm growth rate:
+  ///
+  ///     residual = cover at that measurement - growth * days since grazing
+  ///
+  /// The planner writes a single default residual for every break, so the
+  /// first measurement afterwards is what tells us whether this paddock was
+  /// actually left at 1,450 or 1,700. Returns null when there is no measurement
+  /// soon enough afterwards, because extrapolating further amplifies the error
+  /// in the growth rate.
+  static int? inferredResidualFor(
+    Grazing grazing,
+    List<Measurement> measurements,
+    double growthKgDmPerHaPerDay, {
+    int maxDays = 10,
+    int minKgDmHa = 800,
+    int maxKgDmHa = 2400,
+  }) {
+    return _inferredFrom(
+      grazing,
+      measurements,
+      growthKgDmPerHaPerDay,
+      maxDays: maxDays,
+      minKgDmHa: minKgDmHa,
+      maxKgDmHa: maxKgDmHa,
+    )?.residual;
+  }
+
+  /// Internal: the inferred residual plus the measurement that resolved it.
+  static ({int residual, DateTime measuredAt})? _inferredFrom(
+    Grazing grazing,
+    List<Measurement> measurements,
+    double growthKgDmPerHaPerDay, {
+    int maxDays = 10,
+    int minKgDmHa = 800,
+    int maxKgDmHa = 2400,
+  }) {
+    if (growthKgDmPerHaPerDay <= 0) return null;
+
+    Measurement? after;
+    for (final m in measurements) {
+      if (m.paddockId != grazing.paddockId) continue;
+      if (!m.at.isAfter(grazing.at)) continue;
+      if (after == null || m.at.isBefore(after.at)) after = m;
+    }
+    if (after == null) return null;
+
+    final days = after.at.difference(grazing.at).inHours / 24.0;
+    if (days < 1 || days > maxDays) return null;
+
+    final residual = (after.cover - growthKgDmPerHaPerDay * days).round();
+    if (residual < minKgDmHa || residual > maxKgDmHa) return null;
+    return (residual: residual, measuredAt: after.at);
+  }
+
+  /// The residual to apply automatically to a new break.
+  ///
+  /// This is the **average** of the residuals inferred from the most recent
+  /// round of measurements — every grazing the latest walk resolved — so the
+  /// value follows what the herd is actually being left with and refreshes
+  /// itself each time covers are measured. Falls back to the 60-day median, then
+  /// to [fallback], when the latest walk resolved no grazings.
+  Future<int> typicalResidualKgDmHa({int fallback = 1600}) async {
+    final growth = await effectiveFarmGrowthKgDmPerHaPerDay();
+    if (growth <= 0) return fallback;
+
+    final allM = await _loadMeasurements();
+    final allG = await _loadGrazings();
+    if (allM.isEmpty) return fallback;
+
+    DateTime? walkAt;
+    for (final m in allM) {
+      if (walkAt == null || m.at.isAfter(walkAt)) walkAt = m.at;
+    }
+
+    final fromLatestWalk = <int>[];
+    final recent = <int>[];
+    final cutoff = DateTime.now().subtract(const Duration(days: 60));
+
+    for (final g in allG) {
+      final inf = _inferredFrom(g, allM, growth);
+      if (inf == null) continue;
+      if (farmingDaysBetween(inf.measuredAt, walkAt!) == 0) {
+        fromLatestWalk.add(inf.residual);
+      }
+      if (!g.at.isBefore(cutoff)) recent.add(inf.residual);
+    }
+
+    if (fromLatestWalk.isNotEmpty) {
+      final sum = fromLatestWalk.reduce((a, b) => a + b);
+      return (sum / fromLatestWalk.length).round();
+    }
+    if (recent.isNotEmpty) {
+      recent.sort();
+      return recent[recent.length ~/ 2];
+    }
+    return fallback;
+  }
+
+  /// Fallback pre-graze target when there are no grazings to average.
+  static const int defaultPreGrazingCover = 2800;
+
+  /// Average **predicted pre-graze cover** of the grazings in the last
+  /// [windowDays] days.
+  ///
+  /// The prediction is recomputed from the freshest cover known before each
+  /// grazing rather than read off the stored `preCover` field, because older
+  /// grazings stored the cover at the moment the break was planned instead of
+  /// growing it forward to the grazing day — which made them 200–300 low and
+  /// dragged any average of them down. Nothing is capped: a paddock that has
+  /// been spelled long is supposed to read high, because that is the signal
+  /// that it is heading for a rank residual.
+  Future<int?> recentPreGrazingCover({int windowDays = 7}) async {
+    final growth = await effectiveFarmGrowthKgDmPerHaPerDay();
+    if (growth <= 0) return null;
+
+    final allG = await _loadGrazings();
+    final allM = await _loadMeasurements();
+    if (allG.isEmpty || allM.isEmpty) return null;
+
+    final paddocks = await loadPaddocks();
+    final ids = paddocks
+        .where((p) => p.includeInRotation || p.isSilage)
+        .map((p) => p.id)
+        .toSet();
+
+    final now = DateTime.now();
+    final from = now.subtract(Duration(days: windowDays));
+
+    final values = <int>[];
+    for (final g in allG) {
+      if (!ids.contains(g.paddockId)) continue;
+      if (g.at.isAfter(now) || g.at.isBefore(from)) continue;
+
+      // Freshest cover known before this grazing: a measurement or a residual.
+      DateTime? anchorAt;
+      var anchorCover = 0;
+      for (final m in allM) {
+        if (m.paddockId != g.paddockId || m.at.isAfter(g.at)) continue;
+        if (anchorAt == null || m.at.isAfter(anchorAt)) {
+          anchorAt = m.at;
+          anchorCover = m.cover;
+        }
+      }
+      for (final other in allG) {
+        if (other.paddockId != g.paddockId || !other.at.isBefore(g.at)) {
+          continue;
+        }
+        if (anchorAt == null || other.at.isAfter(anchorAt)) {
+          anchorAt = other.at;
+          anchorCover = other.residual;
+        }
+      }
+      if (anchorAt == null) continue;
+
+      final days = farmingDaysBetween(anchorAt, g.at);
+      if (days < 0) continue;
+      values.add(clampCover(anchorCover + (days * growth).round()));
+    }
+    if (values.isEmpty) return null;
+    return (values.reduce((a, b) => a + b) / values.length).round();
+  }
+
+  /// The **measured** cover trend: the area-weighted average cover on each of
+  /// the last [walks] farm walks, and how far it moved per day.
+  ///
+  /// This is the APC graph as a number. No growth rate, no residuals, no model
+  /// — just what the readings did between two walks.
+  Future<
+    ({
+      double perDay,
+      double perWeek,
+      double fromCover,
+      double toCover,
+      DateTime from,
+      DateTime to,
+      int walks,
+    })?
+  >
+  measuredCoverTrend({int walks = 4}) async {
+    final allM = await _loadMeasurements();
+    if (allM.isEmpty) return null;
+
+    final paddocks = await loadPaddocks();
+    final areaById = <String, double>{
+      for (final p in paddocks)
+        if (p.includeInRotation || p.isSilage || p.shutForSilage)
+          p.id: p.areaHa,
+    };
+    if (areaById.isEmpty) return null;
+
+    final byDay = <DateTime, List<Measurement>>{};
+    for (final m in allM) {
+      if (!areaById.containsKey(m.paddockId)) continue;
+      (byDay[farmingDay(m.at)] ??= []).add(m);
+    }
+
+    // A farm walk is a day with readings on at least half the paddocks; that
+    // filters out the odd single-paddock correction while keeping short walks.
+    final walkDays = byDay.keys.where(
+      (d) => (byDay[d]?.length ?? 0) * 2 >= areaById.length,
+    ).toList()..sort();
+    if (walkDays.length < 2) return null;
+
+    double apcOn(DateTime day) {
+      var area = 0.0;
+      var sum = 0.0;
+      for (final m in byDay[day] ?? const <Measurement>[]) {
+        final a = areaById[m.paddockId] ?? 0;
+        area += a;
+        sum += m.cover * a;
+      }
+      return area <= 0 ? 0 : sum / area;
+    }
+
+    final take = walkDays.length <= walks
+        ? walkDays
+        : walkDays.sublist(walkDays.length - walks);
+    final from = take.first;
+    final to = take.last;
+    final span = farmingDaysBetween(from, to);
+    if (span < 1) return null;
+
+    final fromCover = apcOn(from);
+    final toCover = apcOn(to);
+    final perDay = (toCover - fromCover) / span;
+    return (
+      perDay: perDay,
+      perWeek: perDay * 7,
+      fromCover: fromCover,
+      toCover: toCover,
+      from: from,
+      to: to,
+      walks: take.length,
+    );
+  }
+
+  /// The pre-graze and residual figures used by the feed wedge and the cover
+  /// trend, so the two widgets cannot disagree. A manual override wins;
+  /// otherwise the pre-graze cover is the average predicted pre-graze cover of
+  /// the current round, and the residual is the value inferred from the latest
+  /// round of measurements.
+  Future<PrePostTargets> prePostTargets({
+    int defaultPre = defaultPreGrazingCover,
+  }) async {
+    final preOverride = await loadFeedWedgePreGrazingOverride();
+    final postOverride = await loadFeedWedgePostGrazingResidualOverride();
+    final measuredPre = await recentPreGrazingCover();
+    final inferredPost = await typicalResidualKgDmHa();
+    return (
+      pre: preOverride ?? measuredPre ?? defaultPre,
+      post: postOverride ?? inferredPost,
+      overridden: preOverride != null || postOverride != null,
+    );
+  }
+
   Future<double> computeFarmGrowthKgDmPerHaPerDay() async {
     final msAll = await _loadMeasurements();
     final gsAll = await _loadGrazings();
+    final allS = await _loadSilageCuts();
     final includedIds = await _includedPaddockIds();
-    return computeFarmGrowthFromLoadedData(msAll, gsAll, includedIds);
+    return computeFarmGrowthFromLoadedData(
+      msAll,
+      gsAll,
+      includedIds,
+      silageCuts: allS,
+    );
   }
 
   /// Same rules as [computeFarmGrowthKgDmPerHaPerDay] but uses already-decoded lists
@@ -951,8 +1341,9 @@ class Storage {
   double computeFarmGrowthFromLoadedData(
     List<Measurement> msAll,
     List<Grazing> gsAll,
-    Set<String> includedIds,
-  ) {
+    Set<String> includedIds, {
+    List<SilageCut> silageCuts = const [],
+  }) {
     if (msAll.length < 2) return 0;
 
     final ms = msAll.where((m) => includedIds.contains(m.paddockId)).toList();
@@ -963,6 +1354,16 @@ class Storage {
       (byPdk[m.paddockId] ??= []).add(m);
     }
 
+    // Farm growth = the mean of every paddock's current growth rate, counting
+    // only the positive ones.
+    //
+    // Growth is measured from the last point at which the paddock's cover was
+    // actually known: the previous measurement, or the residual of a grazing
+    // or silage cut that happened since. Growing forward from that anchor to
+    // today's measurement means the pre-graze cover — a plan value — cancels
+    // out of the arithmetic and never has to be trusted. It also means a
+    // planned break cannot inflate the figure, because only the residual is
+    // used, not the difference between two guesses.
     final rates = <double>[];
 
     for (final entry in byPdk.entries) {
@@ -972,33 +1373,100 @@ class Storage {
 
       final cur = list.last;
 
-      for (int i = list.length - 2; i >= 0; i--) {
-        final prev = list[i];
+      // Latest known cover strictly before this measurement.
+      DateTime? anchorAt;
+      var anchorCover = 0;
+      var haveAnchor = false;
 
-        final daysDiff = cur.at.difference(prev.at).inDays;
-        if (daysDiff <= 0) continue;
-
-        final grazedBetween = Storage.paddockGrazedBetweenFromList(
-          gsAll,
-          paddockId,
-          prev.at,
-          cur.at,
-        );
-        if (grazedBetween) continue;
-
-        final rate = (cur.cover - prev.cover) / daysDiff;
-
-        if (rate <= 0) continue;
-
-        rates.add(rate);
-        break;
+      void consider(DateTime at, int cover) {
+        if (!at.isBefore(cur.at)) return;
+        if (haveAnchor && !at.isAfter(anchorAt!)) return;
+        anchorAt = at;
+        anchorCover = cover;
+        haveAnchor = true;
       }
+
+      for (final m in list) {
+        consider(m.at, m.cover);
+      }
+      for (final g in gsAll) {
+        if (g.paddockId == paddockId) consider(g.at, g.residual);
+      }
+      for (final s in silageCuts) {
+        if (s.paddockId == paddockId) consider(s.at, s.residual);
+      }
+      if (!haveAnchor) continue;
+
+      // Fractional days: truncating to whole days (inDays) inflated the rate
+      // by up to a day's worth of growth per interval.
+      final days = cur.at.difference(anchorAt!).inHours / 24.0;
+      if (days < _minGrowthIntervalDays) continue;
+      final rate = (cur.cover - anchorCover) / days;
+
+      // Positive only: a cover that fell with nothing to explain it is an
+      // unreported removal or a bad reading, not grass growing backwards.
+      if (rate <= 0) continue;
+      if (rate > _maxGrowthRatePerDay) continue;
+
+      rates.add(rate);
     }
 
     if (rates.isEmpty) return 0;
+    return rates.reduce((a, b) => a + b) / rates.length;
+  }
 
-    final avg = rates.reduce((a, b) => a + b) / rates.length;
-    return avg;
+  /// DM removed per hectare for [paddockId] between [from] and [to] by
+  /// grazings and silage cuts, prorating multi-day events that only partly
+  /// overlap the interval.
+  static double removedKgDmHaBetween(
+    List<Grazing> grazings,
+    List<SilageCut> silageCuts,
+    String paddockId,
+    DateTime from,
+    DateTime to,
+  ) {
+    final fromDay = calendarDay(from);
+    final toDayExclusive = DateTime(to.year, to.month, to.day + 1);
+
+    double overlapFraction(DateTime at, int durationDays) {
+      final start = calendarDay(at);
+      final days = durationDays < 1 ? 1 : durationDays;
+      final end = DateTime(start.year, start.month, start.day + days);
+      final lo = start.isAfter(fromDay) ? start : fromDay;
+      final hi = end.isBefore(toDayExclusive) ? end : toDayExclusive;
+      final overlap = hi.difference(lo).inDays;
+      if (overlap <= 0) return 0.0;
+      return overlap >= days ? 1.0 : overlap / days;
+    }
+
+    var removed = 0.0;
+
+    // A paddock split across two breaks on the same day (AM/PM) is stored as
+    // two grazing rows carrying the same pre/post, so count one removal per
+    // paddock per start day instead of adding it twice.
+    final grazingsByDay = <DateTime, List<Grazing>>{};
+    for (final g in grazings) {
+      if (g.paddockId != paddockId) continue;
+      (grazingsByDay[calendarDay(g.at)] ??= []).add(g);
+    }
+    for (final group in grazingsByDay.values) {
+      var bestDrop = 0;
+      var dur = 1;
+      for (final g in group) {
+        final drop = g.preCover - g.residual;
+        if (drop > bestDrop) bestDrop = drop;
+        if (g.durationDays > dur) dur = g.durationDays;
+      }
+      if (bestDrop <= 0) continue;
+      final share = overlapFraction(group.first.at, dur);
+      if (share > 0) removed += bestDrop * share;
+    }
+    for (final s in silageCuts) {
+      if (s.paddockId != paddockId) continue;
+      final share = overlapFraction(s.at, 1);
+      if (share > 0) removed += (s.preCover - s.residual) * share;
+    }
+    return removed;
   }
 
   static bool paddockGrazedBetweenFromList(

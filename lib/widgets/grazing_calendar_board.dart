@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:intl/intl.dart' hide TextDirection;
 
 import '../utils.dart';
@@ -1020,7 +1021,7 @@ class _GrazingCalendarBoardState extends State<GrazingCalendarBoard>
                         controller: _vDate,
                         physics: _vPhysics,
                         itemExtent: rowStride,
-                        cacheExtent: rowStride * 4,
+                        scrollCacheExtent: ScrollCacheExtent.pixels(rowStride * 4),
                         itemCount: _days.length,
                         itemBuilder: (context, i) =>
                             _dayRow(i, inGrid: false),
@@ -1063,7 +1064,8 @@ class _GrazingCalendarBoardState extends State<GrazingCalendarBoard>
                                     controller: _vGrid,
                                     physics: _vPhysics,
                                     itemExtent: rowStride,
-                                    cacheExtent: rowStride * 3,
+                                    scrollCacheExtent:
+                                        ScrollCacheExtent.pixels(rowStride * 3),
                                     itemCount: _days.length,
                                     itemBuilder: (context, i) =>
                                         _dayRow(i, inGrid: true),
