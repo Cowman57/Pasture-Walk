@@ -1,2 +1,5 @@
 #include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.debug.xcconfig"
 #include "Generated.xcconfig"
+
+// Override app name for debug builds
+BUNDLE_DISPLAY_NAME = PastureWalk (Debug)

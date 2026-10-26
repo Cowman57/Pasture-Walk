@@ -7,13 +7,15 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-// Load keystore properties (android/key.properties)
+// Release signing is configured from android/key.properties.
+// That file is intentionally NOT in version control, so debug and profile
+// builds must work without it. Only release builds require it (see below).
 val keystoreProperties = Properties()
 val keystorePropertiesFile = rootProject.file("key.properties")
-if (!keystorePropertiesFile.exists()) {
-    throw GradleException("Missing key.properties for release signing.")
+val hasReleaseKeystore = keystorePropertiesFile.exists()
+if (hasReleaseKeystore) {
+    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
-keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 
 android {
     namespace = "nz.co.kalma.pasturewalk"
@@ -21,21 +23,22 @@ android {
     ndkVersion = flutter.ndkVersion
 
     signingConfigs {
-        create("release") {
-            keyAlias = keystoreProperties["keyAlias"] as String
-            keyPassword = keystoreProperties["keyPassword"] as String
-            storeFile = file(keystoreProperties["storeFile"] as String)
-            storePassword = keystoreProperties["storePassword"] as String
+        if (hasReleaseKeystore) {
+            create("release") {
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["keyPassword"] as String
+                storeFile = file(keystoreProperties["storeFile"] as String)
+                storePassword = keystoreProperties["storePassword"] as String
+            }
         }
     }
 
-    buildTypes {
-        getByName("release") {
-            signingConfig = signingConfigs.getByName("release")
-            isMinifyEnabled = false
-            isShrinkResources = false
-        }
-        // Debug stays debug-signed automatically; no need to set anything here.
+defaultConfig {
+        applicationId = "nz.co.kalma.pasturewalk"
+        minSdk = flutter.minSdkVersion
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
     }
 
     compileOptions {
@@ -47,13 +50,38 @@ android {
         jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
-    defaultConfig {
-        applicationId = "nz.co.kalma.pasturewalk"
-        minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
-        versionCode = flutter.versionCode
-        versionName = flutter.versionName
+    buildTypes {
+        getByName("debug") {
+            applicationIdSuffix = ".debug"
+        }
+        getByName("release") {
+            signingConfigs.findByName("release")?.let { signingConfig = it }
+            isMinifyEnabled = false
+            isShrinkResources = false
+        }
     }
+}
+
+// Fail release builds with a helpful message when key.properties is absent,
+// instead of silently producing an unsigned APK.
+val checkReleaseKeystore by tasks.registering {
+    doFirst {
+        if (!hasReleaseKeystore) {
+            throw GradleException(
+                "Missing android/key.properties, which is required to sign release builds.\n" +
+                    "Create android/key.properties with:\n" +
+                    "  storePassword=<password>\n" +
+                    "  keyPassword=<password>\n" +
+                    "  keyAlias=pasturewalk\n" +
+                    "  storeFile=../../pasturewalk.keystore\n" +
+                    "Debug and profile builds do not need this file."
+            )
+        }
+    }
+}
+
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    dependsOn(checkReleaseKeystore)
 }
 
 flutter {

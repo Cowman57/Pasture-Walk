@@ -1,6 +1,6 @@
-# Pasture Walk
+# PastureWalk
 
-Pasture Walk is an Android app for recording paddock covers and grazings.
+PastureWalk is an Android app for recording paddock covers and grazings.
 
 ## Install (Android)
 

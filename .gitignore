@@ -13,3 +13,12 @@ jdk-*/
 flutter_linux_3.16.9-stable.tar.xz
 openjdk-*.tar.gz
 lazygit.tar.gz
+
+# Flutter / Dart build artefacts (never commit these)
+.dart_tool/
+.flutter-plugins-dependencies
+android/.kotlin/
+android/local.properties
+android/key.properties
+**/*.keystore
+**/*.jks
