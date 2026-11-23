@@ -423,7 +423,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ListTile(
             leading: const Icon(Icons.file_upload),
             title: const Text('Import paddocks + map'),
-            subtitle: const Text('GeoJSON polygons or Shapefile zip'),
+            subtitle: const Text('GeoJSON, KML or Shapefile zip'),
             onTap: () => Navigator.of(context).push(
               MaterialPageRoute(builder: (_) => const FarmMapImportScreen()),
             ),

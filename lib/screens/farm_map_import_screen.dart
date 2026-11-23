@@ -9,6 +9,7 @@ import 'package:uuid/uuid.dart';
 import 'package:shapefile/shapefile.dart' as shp;
 
 import '../models.dart';
+import '../services/kml_parser.dart';
 import '../storage.dart';
 
 class FarmMapImportScreen extends StatefulWidget {
@@ -63,7 +64,7 @@ class _FarmMapImportScreenState extends State<FarmMapImportScreen> {
     try {
       final res = await FilePicker.platform.pickFiles(
         type: FileType.custom,
-        allowedExtensions: const ['geojson', 'json', 'zip'],
+        allowedExtensions: const ['geojson', 'json', 'kml', 'zip'],
         withData: false,
       );
 
@@ -86,6 +87,10 @@ class _FarmMapImportScreenState extends State<FarmMapImportScreen> {
       if (ext == 'zip') {
         sourceType = 'zip';
         await _parseShapefileZip(await File(f.path!).readAsBytes());
+      } else if (ext == 'kml') {
+        sourceType = 'kml';
+        final text = await File(f.path!).readAsString();
+        _parseKml(text);
       } else {
         sourceType = 'geojson';
         final text = await File(f.path!).readAsString();
@@ -176,6 +181,22 @@ class _FarmMapImportScreenState extends State<FarmMapImportScreen> {
       );
       featureCollection!['__prj'] = prj;
     }
+  }
+
+  /// KML is converted to the same GeoJSON feature shape everything else uses;
+  /// see [kmlToGeoJsonFeatures] for the mapping and the area derivation.
+  void _parseKml(String text) {
+    final out = kmlToGeoJsonFeatures(text);
+    if (out.isEmpty) {
+      throw Exception('No polygons found in this KML file');
+    }
+
+    features = out;
+    featureCollection = <String, dynamic>{
+      'type': 'FeatureCollection',
+      'features': out,
+    };
+    keys = _collectPropKeys(out);
   }
 
   List<String> _collectPropKeys(List<Map<String, dynamic>> feats) {
@@ -827,7 +848,7 @@ class _FarmMapImportScreenState extends State<FarmMapImportScreen> {
                 ),
                 const SizedBox(height: 6),
                 const Text(
-                  'Supports GeoJSON (.geojson/.json) and Shapefile zip (.zip containing .shp + .shx + .dbf).\n\nThis imports paddock name, area (ha) and geometry. Recording order is managed in-app.',
+                  'Supports GeoJSON (.geojson/.json), KML (.kml) and Shapefile zip (.zip containing .shp + .shx + .dbf).\n\nKML carries no area field, so paddock areas are calculated from the outline.\n\nThis imports paddock name, area (ha) and geometry. Recording order is managed in-app.',
                   style: TextStyle(color: Colors.black54),
                 ),
                 const SizedBox(height: 14),

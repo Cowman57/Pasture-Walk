@@ -75,7 +75,7 @@ class InstructionsScreen extends StatelessWidget {
           ]),
           _H2('Map tab'),
           _Bullets([
-            'Import a farm map (GeoJSON or Shapefile zip) from Settings to show paddock outlines.',
+            'Import a farm map (GeoJSON, KML or Shapefile zip) from Settings to show paddock outlines.',
             'Colours reflect predicted cover; tap a paddock for history, long-press to enter grazing selection.',
             'Scheduled (future) grazings use a stronger blue outline on the paddock; when zoomed in enough, a small cow marker appears on the label.',
             'Use the floating button to switch between satellite imagery and street map.',

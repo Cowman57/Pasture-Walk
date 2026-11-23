@@ -18,6 +18,7 @@ import 'grazing_schedule_preview_screen.dart';
 import 'silage_summary_screen.dart';
 import 'grazing_plan_setup_screen.dart';
 import '../widgets/grazing_planner.dart';
+import '../services/update_service.dart';
 
 const _coverHeatStops = <(double, Color)>[
   (1400, Color(0xFFD32F2F)),
@@ -376,6 +377,155 @@ class _HomeScreenState extends State<HomeScreen>
       duration: _grazingBarDropDuration,
     );
     _load();
+    _maybeCheckForUpdatesOnStartup();
+  }
+
+  // ---------- app updates ----------
+
+  /// Guards the startup check so it runs at most once per launch.
+  static bool _startupUpdateChecked = false;
+
+  /// Best effort, once per launch — must never block the home screen.
+  Future<void> _maybeCheckForUpdatesOnStartup() async {
+    if (_startupUpdateChecked) return;
+    _startupUpdateChecked = true;
+    try {
+      final update = await UpdateService.checkForUpdates();
+      if (update == null || !mounted) return;
+      if (await UpdateService.isSnoozed()) return;
+      if (!mounted) return;
+      await _showUpdateDialog(update);
+    } catch (e) {
+      debugPrint('Update check failed: $e');
+    }
+  }
+
+  Future<void> _showUpdateDialog(AppUpdate update) async {
+    final notes = (update.notes ?? '').trim();
+    final size = update.sizeLabel;
+    final canInstall = (update.assetUrl ?? '').isNotEmpty;
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Update available — ${update.version}'),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420, maxHeight: 320),
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (size != null)
+                  Text(
+                    'Download size: $size',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                if (notes.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(notes, style: const TextStyle(fontSize: 13)),
+                ],
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              UpdateService.snoozeFor(const Duration(days: 1));
+            },
+            child: const Text('Later'),
+          ),
+          ElevatedButton(
+            onPressed: canInstall
+                ? () {
+                    Navigator.pop(ctx);
+                    _downloadAndStartInstaller(update);
+                  }
+                : null,
+            child: const Text('Download & install'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Streams the APK with a progress dialog, then hands it to the system
+  /// package installer, which asks the user to confirm the update.
+  Future<void> _downloadAndStartInstaller(AppUpdate update) async {
+    final progress = ValueNotifier<double>(0);
+    var cancelled = false;
+    var dialogOpen = true;
+    final nav = Navigator.of(context, rootNavigator: true);
+
+    void closeDialog() {
+      if (!dialogOpen) return;
+      dialogOpen = false;
+      nav.pop();
+    }
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Text('Downloading Pasture-Walk ${update.version}'),
+        content: ValueListenableBuilder<double>(
+          valueListenable: progress,
+          builder: (context, value, _) => Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              LinearProgressIndicator(value: value <= 0 ? null : value),
+              const SizedBox(height: 10),
+              Text('${(value * 100).toStringAsFixed(0)}%'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              cancelled = true;
+              closeDialog();
+            },
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+
+    String? path;
+    Object? error;
+    try {
+      path = await UpdateService.downloadInstaller(
+        update,
+        onProgress: (p) => progress.value = p,
+        isCancelled: () => cancelled,
+      );
+    } on UpdateCancelled {
+      // User backed out — nothing to install.
+    } catch (e) {
+      error = e;
+    }
+
+    closeDialog();
+    if (!mounted) return;
+
+    if (error != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Download failed: $error')),
+      );
+      return;
+    }
+    if (path == null || cancelled) return;
+
+    try {
+      await UpdateService.runInstaller(path);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not start the installer: $e')),
+      );
+    }
   }
 
   @override
@@ -1369,7 +1519,7 @@ class _HomeScreenState extends State<HomeScreen>
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    'Import a farm map (GeoJSON or Shapefile zip) from Settings to enable the map view.',
+                    'Import a farm map (GeoJSON, KML or Shapefile zip) from Settings to enable the map view.',
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 12),

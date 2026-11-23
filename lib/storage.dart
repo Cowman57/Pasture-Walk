@@ -695,11 +695,18 @@ class Storage {
 
   /// Anchor used for predicting a paddock's cover at [asOf].
   ///
-  /// Differs from [latestAnchorFromLists] in the two ways that matter once
-  /// grazings are planned ahead of time:
-  ///  * events are ordered by *farming day* ([farmingDay]), not clock time, so a
-  ///    break planned for today cannot override a cover measured this morning;
-  ///  * within one farming day a real measurement outranks a planned residual.
+  /// Events are ordered by *farming day* ([farmingDay]), not clock time, and two
+  /// rules decide what wins within a day:
+  ///  * a residual only counts once its timestamp has passed, so a break planned
+  ///    for later today cannot wipe out this morning's cover;
+  ///  * on the same farming day the **covers** decide. A reading well above the
+  ///    residual is the pre-graze cover (you walk the paddock, then put cows in
+  ///    it) and the grazing wins — otherwise the paddock keeps predicting as
+  ///    rank for a week and keeps offering itself to the planner. A reading at
+  ///    or below the residual is a genuine post-graze observation, and an
+  ///    observation outranks a planned residual.
+  static const int sameDayGrazeToleranceKgDmHa = 150;
+
   static Anchor? predictionAnchorFromLists(
     List<Measurement> allMeasurements,
     List<Grazing> allGrazings,
@@ -715,21 +722,44 @@ class Storage {
     void consider(DateTime at, int cover, bool measured) {
       final day = farmingDay(at);
       if (day.isAfter(today)) return; // not happened yet
+      // A residual is a plan: it only applies once its time has passed.
+      if (!measured && at.isAfter(asOf)) return;
+
       if (bestAt == null) {
         best = Anchor(at, cover);
         bestAt = at;
         bestMeasured = measured;
         return;
       }
+
+      void take() {
+        best = Anchor(at, cover);
+        bestAt = at;
+        bestMeasured = measured;
+      }
+
       final cmp = day.compareTo(farmingDay(bestAt!));
       if (cmp < 0) return;
-      final takesIt = cmp > 0 ||
-          (measured && !bestMeasured) ||
-          (measured == bestMeasured && at.isAfter(bestAt!));
-      if (!takesIt) return;
-      best = Anchor(at, cover);
-      bestAt = at;
-      bestMeasured = measured;
+      if (cmp > 0) {
+        take();
+        return;
+      }
+
+      // Same farming day: later event of the same kind wins.
+      if (measured == bestMeasured) {
+        if (at.isAfter(bestAt!)) take();
+        return;
+      }
+
+      final measuredCover = measured ? cover : best!.coverKgDmHa;
+      final residualCover = measured ? best!.coverKgDmHa : cover;
+      if (measuredCover > residualCover + sameDayGrazeToleranceKgDmHa) {
+        // The reading is the pre-graze cover, so the grazing is the newer truth.
+        if (!measured) take();
+      } else {
+        // The reading is a post-graze observation, so it stands.
+        if (measured) take();
+      }
     }
 
     for (final m in allMeasurements) {
